@@ -733,6 +733,21 @@ local function slug(s)
     return (s or ""):lower():gsub("[^a-z0-9]+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
 end
 
+local function truncateTitle(s, max_len)
+    s = s or ""
+    max_len = max_len or 40
+    if #s <= max_len then return s end
+    return s:sub(1, max_len - 1):gsub("%s+%S*$", "") .. "…"
+end
+
+local function buildCitation(author, title)
+    local t = truncateTitle(title)
+    if author and author ~= "" then
+        return "— " .. author .. ", " .. t
+    end
+    return "— " .. t
+end
+
 function MyClippings:buildJumpLink(item)
     if not item.pos0 and not item.page then return nil end
     local target = item.pos0 or tostring(item.page)
@@ -799,7 +814,8 @@ function MyClippings:writeHTML(out_path)
     put('h1{font-size:1.6em;border-bottom:2px solid #333;padding-bottom:0.3em;}')
     put('h2{font-size:1.3em;margin-top:2em;color:#5a3e2b;border-bottom:1px solid #ccc;padding-bottom:0.2em;}')
     put('.author{font-size:0.85em;color:#777;font-style:italic;margin-top:-0.5em;margin-bottom:1em;}')
-    put('blockquote{margin:1em 0;padding:0.9em 1.1em;border-radius:14px;border:1px solid #ddc9ae;background:#f5efe4;font-style:italic;}')
+    put('blockquote{margin:1em 0;padding:0.9em 1.1em;border-radius:14px;border:1px solid #ddc9ae;background:#f5efe4;font-style:normal;}')
+    put('.citation{font-size:0.7em;color:#a08060;font-style:italic;margin-top:0.4em;}')
     put('.meta{font-size:0.75em;color:#999;margin-top:0.4em;font-style:normal;}')
     put('.meta a{color:#7a5c3e;text-decoration:underline;}')
     put('.chapter{font-size:0.78em;color:#a08060;}')
@@ -814,6 +830,7 @@ function MyClippings:writeHTML(out_path)
             local book = canon[it.book_path] or self.db.books[it.book_path] or {}
             local link = self:buildJumpLink(it)
             put('<blockquote>&ldquo;' .. htmlEscape(it.text) .. '&rdquo;')
+            put('<div class="citation">' .. htmlEscape(buildCitation(book.author, book.title)) .. '</div>')
             put('<div class="meta">' .. htmlEscape(book.title or "") ..
                 (it.chapter ~= "" and (' &middot; <span class="chapter">' .. htmlEscape(it.chapter) .. '</span>') or "") ..
                 ' &middot; ' .. htmlEscape(it.datetime or ""))
@@ -838,13 +855,14 @@ function MyClippings:writeHTML(out_path)
             for _, it in ipairs(by_book[key]) do
                 local link = self:buildJumpLink(it)
                 put('<blockquote>&ldquo;' .. htmlEscape(it.text) .. '&rdquo;')
+                put('<div class="citation">' .. htmlEscape(buildCitation(book.author, book.title)) .. '</div>')
                 put('<div class="meta">' ..
                     (it.chapter ~= "" and ('<span class="chapter">' .. htmlEscape(it.chapter) .. '</span> &middot; ') or "") ..
                     htmlEscape(it.datetime or ""))
                 if link then
                     put(' &middot; <a href="' .. link .. '">p.' .. htmlEscape(tostring(it.page or "")) .. '</a>')
                 end
-                put('</div></blockquote>')
+                    put('</div></blockquote>')
             end
         end
     end
