@@ -24,6 +24,10 @@ local MyClippings = WidgetContainer:extend{
 local REGEN_DEBOUNCE_SECONDS = 8
 local LINK_SCHEME = "hsjump"
 
+-- Forward declarations: defined further down (near mergeOverlappingHighlights),
+-- but also needed by pushToCurrentBook, which comes earlier in the file.
+local normText, levenshtein, textsOverlap, sourcesQualifyForMerge
+
 function MyClippings:init()
     self.settings = LuaSettings:open(
         ("%s/%s"):format(DataStorage:getSettingsDir(), "myclippings_settings.lua")
@@ -88,6 +92,14 @@ end
 
 function MyClippings:getGroupMode()
     return self.settings:readSetting("group_mode") or "book" -- "book" or "timeline"
+end
+
+function MyClippings:getMergeSourceFilter()
+    return self.settings:readSetting("merge_source_filter") or "all" -- "kindle", "koreader", or "all"
+end
+
+function MyClippings:getMergeMaxDiffPercent()
+    return self.settings:readSetting("merge_max_diff_percent") or 8
 end
 
 -- ===================== Persistent DB =====================
@@ -215,7 +227,44 @@ function MyClippings:dedupeKey(item)
     return title_key .. "|" .. (item.text or "")
 end
 
+-- KOReader keeps a highlight's creation datetime stable across edits (only
+-- its text/pos0/pos1 change when you resize the selection), so book +
+-- datetime is a stable identity for "this is the same highlight, possibly
+-- edited" -- unlike dedupeKey, which is keyed on the text itself and so
+-- treats every edit as a brand new highlight.
+function MyClippings:koreaderEditKey(item)
+    local canon = self:buildCanonicalBooks()
+    local group = canon[item.book_path]
+    local title_key = group and group.key or (item.book_path or "")
+    return title_key .. "|" .. (item.datetime or "")
+end
+
 function MyClippings:addItem(item)
+    if item.source == "koreader" and item.datetime and item.datetime ~= "" then
+        self._koreader_id_index = self._koreader_id_index or {}
+        if not self._koreader_id_built then
+            for i, it in ipairs(self.db.items) do
+                if it.source == "koreader" and it.datetime and it.datetime ~= "" then
+                    self._koreader_id_index[self:koreaderEditKey(it)] = i
+                end
+            end
+            self._koreader_id_built = true
+        end
+        local id = self:koreaderEditKey(item)
+        local existing_idx = self._koreader_id_index[id]
+        local existing = existing_idx and self.db.items[existing_idx]
+        if existing then
+            local changed = existing.text ~= item.text or existing.pos0 ~= item.pos0 or existing.pos1 ~= item.pos1
+            for k, v in pairs(item) do existing[k] = v end
+            if changed then self._seen_built = false end -- text changed, exact-match dedup cache is now stale
+            return changed
+        end
+        table.insert(self.db.items, item)
+        self._koreader_id_index[id] = #self.db.items
+        self._seen_built = false
+        return true
+    end
+
     self._seen = self._seen or {}
     if not self._seen_built then
         for _, it in ipairs(self.db.items) do
@@ -228,6 +277,46 @@ function MyClippings:addItem(item)
     self._seen[key] = true
     table.insert(self.db.items, item)
     return true
+end
+
+-- One-time cleanup for highlights that were already duplicated by the
+-- edit-tracking bug above (each edit of a KOReader highlight appended a
+-- new entry instead of updating in place). Keeps the last entry for each
+-- (book, datetime) id, since later pulls saw the highlight's most recent
+-- text at the time they ran.
+function MyClippings:dedupeKoreaderEditsById()
+    local last_by_id = {}
+    local order = {}
+    for _, it in ipairs(self.db.items) do
+        if it.source == "koreader" and it.datetime and it.datetime ~= "" then
+            local id = self:koreaderEditKey(it)
+            if not last_by_id[id] then table.insert(order, id) end
+            last_by_id[id] = it
+        end
+    end
+    local kept = {}
+    local placed = {}
+    for _, it in ipairs(self.db.items) do
+        if it.source == "koreader" and it.datetime and it.datetime ~= "" then
+            local id = self:koreaderEditKey(it)
+            if not placed[id] then
+                placed[id] = true
+                table.insert(kept, last_by_id[id])
+            end
+        else
+            table.insert(kept, it)
+        end
+    end
+    local removed = #self.db.items - #kept
+    if removed > 0 then
+        self.db.items = kept
+        self._seen = nil
+        self._seen_built = false
+        self._koreader_id_index = nil
+        self._koreader_id_built = false
+        self:saveDB()
+    end
+    return removed
 end
 
 -- ===================== Live sync: annotation event =====================
@@ -594,6 +683,13 @@ function MyClippings:pushToCurrentBook()
         return
     end
 
+    -- Clean up first, so "pending" reflects merged/deduped state rather
+    -- than pushing near-duplicate Kindle re-captures as separate
+    -- highlights into the book.
+    self:dedupeExistingItems()
+    self:dedupeKoreaderEditsById()
+    self:mergeOverlappingHighlights(self:getMergeSourceFilter(), self:getMergeMaxDiffPercent() / 100)
+
     local canon = self:buildCanonicalBooks()
     local pending = {}
     for _, it in ipairs(self.db.items) do
@@ -610,43 +706,75 @@ function MyClippings:pushToCurrentBook()
         return
     end
 
-    local pushed, not_found = 0, 0
+    -- Existing native highlights already in this book -- pushing a
+    -- Kindle-Clippings item that overlaps one of these would create a
+    -- second, duplicate highlight box on top of a highlight you already
+    -- have, so those are matched against and linked instead of re-added.
+    local max_diff_ratio = self:getMergeMaxDiffPercent() / 100
+    local existing_annotations = (self.ui.annotation and self.ui.annotation.annotations) or {}
+
+    local pushed, matched_existing, not_found = 0, 0, 0
     for _, it in ipairs(pending) do
-        local ok_search, results = pcall(function()
-            return self.ui.document:findAllText(it.text, false, 0, 1, false)
-        end)
-        local match = ok_search and results and results[1]
-        if match and match.start then
-            local ok_add, index = pcall(function()
-                return self.ui.annotation:addItem({
-                    page = match.start,
-                    pos0 = match.start,
-                    pos1 = match["end"] or match.start,
-                    text = it.text,
-                    datetime = (it.datetime ~= "" and it.datetime) or os.date("%Y-%m-%d %H:%M:%S"),
-                    drawer = "lighten",
-                    chapter = it.chapter or "",
-                })
+        local already = nil
+        for _, ann in ipairs(existing_annotations) do
+            if ann.text and textsOverlap(ann.text, it.text, max_diff_ratio) then
+                already = ann
+                break
+            end
+        end
+
+        if already then
+            local real_path = self.ui.document.file
+            it.pos0 = already.pos0
+            it.pos1 = already.pos1
+            it.page = already.pos0
+            it.book_path = real_path
+            self.db.books[real_path] = self.db.books[real_path] or {
+                title = props.title or real_path:match("([^/]+)%.%w+$") or real_path,
+                author = props.authors or props.author or "",
+            }
+            matched_existing = matched_existing + 1
+        else
+            local ok_search, results = pcall(function()
+                return self.ui.document:findAllText(it.text, false, 0, 1, false)
             end)
-            if ok_add then
-                local real_path = self.ui.document.file
-                it.pos0 = match.start
-                it.pos1 = match["end"] or match.start
-                it.book_path = real_path -- so its jump-link points at the real file, not the clippings:// pseudo-path
-                self.db.books[real_path] = self.db.books[real_path] or {
-                    title = props.title or real_path:match("([^/]+)%.%w+$") or real_path,
-                    author = props.authors or props.author or "",
-                }
-                pushed = pushed + 1
-                pcall(function()
-                    self.ui:handleEvent(Event:new("AnnotationsModified",
-                        { { page = match.start, pos0 = match.start, text = it.text }, nb_highlights_added = 1, index_modified = index }))
+            local match = ok_search and results and results[1]
+            if match and match.start then
+                local ok_add, index = pcall(function()
+                    return self.ui.annotation:addItem({
+                        page = match.start,
+                        pos0 = match.start,
+                        pos1 = match["end"] or match.start,
+                        text = it.text,
+                        datetime = (it.datetime ~= "" and it.datetime) or os.date("%Y-%m-%d %H:%M:%S"),
+                        drawer = "lighten",
+                        chapter = it.chapter or "",
+                    })
                 end)
+                if ok_add then
+                    local real_path = self.ui.document.file
+                    it.pos0 = match.start
+                    it.pos1 = match["end"] or match.start
+                    it.book_path = real_path -- so its jump-link points at the real file, not the clippings:// pseudo-path
+                    self.db.books[real_path] = self.db.books[real_path] or {
+                        title = props.title or real_path:match("([^/]+)%.%w+$") or real_path,
+                        author = props.authors or props.author or "",
+                    }
+                    pushed = pushed + 1
+                    -- Track this new annotation so a later duplicate in the
+                    -- same pending batch also matches against it, not just
+                    -- what existed on disk before this push started.
+                    table.insert(existing_annotations, { text = it.text, pos0 = it.pos0, pos1 = it.pos1 })
+                    pcall(function()
+                        self.ui:handleEvent(Event:new("AnnotationsModified",
+                            { { page = match.start, pos0 = match.start, text = it.text }, nb_highlights_added = 1, index_modified = index }))
+                    end)
+                else
+                    not_found = not_found + 1
+                end
             else
                 not_found = not_found + 1
             end
-        else
-            not_found = not_found + 1
         end
     end
 
@@ -654,9 +782,75 @@ function MyClippings:pushToCurrentBook()
         pcall(function() self.ui.annotation:onSaveSettings() end)
     end
 
+    self:mergeOverlappingHighlights(self:getMergeSourceFilter(), max_diff_ratio)
     self:saveDB()
     UIManager:show(InfoMessage:new{
-        text = T(_("Pushed %1 highlight(s) into this book (saved to disk).\n%2 not found verbatim in the text."), pushed, not_found),
+        text = T(_("Pushed %1 new highlight(s) into this book (saved to disk).\n%2 already matched an existing highlight and were linked instead of duplicated.\n%3 not found verbatim in the text."), pushed, matched_existing, not_found),
+    })
+end
+
+-- Collapses overlapping highlights that already exist as real annotations
+-- in the currently open book (e.g. from before pushToCurrentBook started
+-- checking for existing matches, or from re-highlighting the same passage
+-- natively in KOReader more than once). Unlike mergeOverlappingHighlights,
+-- this edits the book's actual annotation list via the same
+-- ReaderHighlight:deleteHighlight() KOReader's own highlight-delete menu
+-- uses, so the extra highlight boxes actually disappear from the book, not
+-- just from the consolidated file. Source-blind: once pushed, a highlight
+-- has no record of whether it came from Kindle or KOReader, so this
+-- compares every pair by text overlap only.
+function MyClippings:mergeAnnotationsInCurrentBook()
+    if not self.ui or not self.ui.annotation or not self.ui.highlight then
+        UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
+        return
+    end
+
+    local anns = self.ui.annotation.annotations
+    local max_diff_ratio = self:getMergeMaxDiffPercent() / 100
+    local to_drop = {}
+    for a = 1, #anns do
+        local ia = anns[a]
+        if ia.text and not to_drop[ia] then
+            for b = a + 1, #anns do
+                local ib = anns[b]
+                if ib.text and not to_drop[ib] and textsOverlap(ia.text, ib.text, max_diff_ratio) then
+                    local drop
+                    if ia.note and not ib.note then
+                        drop = ib
+                    elseif ib.note and not ia.note then
+                        drop = ia
+                    elseif #(ib.text or "") > #(ia.text or "") then
+                        drop = ia
+                    else
+                        drop = ib
+                    end
+                    to_drop[drop] = true
+                    if drop == ia then break end
+                end
+            end
+        end
+    end
+
+    local count = 0
+    for _ in pairs(to_drop) do count = count + 1 end
+    if count == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No overlapping highlights found in this book."), timeout = 3 })
+        return
+    end
+
+    -- Delete from highest index to lowest so removing one doesn't shift
+    -- the indices of items still waiting to be checked/removed.
+    for i = #self.ui.annotation.annotations, 1, -1 do
+        local item = self.ui.annotation.annotations[i]
+        if to_drop[item] then
+            pcall(function() self.ui.highlight:deleteHighlight(i) end)
+        end
+    end
+    pcall(function() self.ui.annotation:onSaveSettings() end)
+
+    UIManager:show(InfoMessage:new{
+        text = T(_("Merged %1 overlapping highlight(s) in this book."), count),
+        timeout = 3,
     })
 end
 
@@ -688,6 +882,8 @@ function MyClippings:dedupeExistingItems()
     end
     self._seen = nil
     self._seen_built = false
+    self._koreader_id_index = nil
+    self._koreader_id_built = false
     local removed = before - #self.db.items
     if removed > 0 then
         self:saveDB()
@@ -695,13 +891,13 @@ function MyClippings:dedupeExistingItems()
     return removed
 end
 
-local function normText(s)
+function normText(s)
     return (s or ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
 end
 
 -- Classic O(n*m) edit distance -- fine here since it's only ever run on
 -- individual highlight-length strings, not full documents.
-local function levenshtein(a, b)
+function levenshtein(a, b)
     local la, lb = #a, #b
     if la == 0 then return lb end
     if lb == 0 then return la end
@@ -719,29 +915,33 @@ local function levenshtein(a, b)
     return prev[lb]
 end
 
-local OVERLAP_MAX_DIFF_RATIO = 0.08 -- merge if the two texts differ by <8%
-
 -- True if two highlight texts look like the same passage captured with a
--- slightly different boundary (Kindle re-highlighting the same spot a
--- character or two off), not two genuinely different highlights.
-local function textsOverlap(a, b)
+-- slightly different boundary (a character or two off at the start/end),
+-- not two genuinely different highlights.
+function textsOverlap(a, b, max_diff_ratio)
     a, b = normText(a), normText(b)
     if a == "" or b == "" then return false end
     if a == b then return true end
     if a:find(b, 1, true) or b:find(a, 1, true) then return true end
     local maxlen = math.max(#a, #b)
     if maxlen > 400 then return false end -- avoid O(n*m) blowup on long passages
-    return levenshtein(a, b) / maxlen <= OVERLAP_MAX_DIFF_RATIO
+    return levenshtein(a, b) / maxlen <= max_diff_ratio
 end
 
--- Collapses near-duplicate highlights within the same book -- but ONLY
--- pairs where at least one side came from Kindle's My Clippings.txt, since
--- that's the source that produces slightly-off-boundary re-captures of the
--- same passage. Two KOReader-native highlights are left alone even if
--- their text happens to overlap, since those are deliberate. Keeps
+function sourcesQualifyForMerge(filter, sa, sb)
+    if filter == "kindle" then return sa == "kindle" and sb == "kindle" end
+    if filter == "koreader" then return sa == "koreader" and sb == "koreader" end
+    return true -- "all"
+end
+
+-- Collapses near-duplicate highlights within the same book. Which pairs
+-- qualify is controlled by source_filter ("kindle" = both sides must be
+-- Kindle-sourced, "koreader" = both must be KOReader-native, "all" = any
+-- combination) and max_diff_ratio (0..1, e.g. 0.08 = merge if the two
+-- texts differ by less than 8%), both set via the plugin menu. Keeps
 -- whichever side has a real position (pos0) so the jump-link survives,
 -- otherwise keeps the longer text.
-function MyClippings:mergeOverlappingKindleClippings()
+function MyClippings:mergeOverlappingHighlights(source_filter, max_diff_ratio)
     local canon = self:buildCanonicalBooks()
     local by_book = {}
     for idx, it in ipairs(self.db.items) do
@@ -761,8 +961,8 @@ function MyClippings:mergeOverlappingKindleClippings()
                     if not to_remove[ib] then
                         local item_a = self.db.items[ia]
                         local item_b = self.db.items[ib]
-                        if (item_a.source == "kindle" or item_b.source == "kindle")
-                            and textsOverlap(item_a.text, item_b.text) then
+                        if sourcesQualifyForMerge(source_filter, item_a.source, item_b.source)
+                            and textsOverlap(item_a.text, item_b.text, max_diff_ratio) then
                             local drop_idx
                             if item_a.pos0 and not item_b.pos0 then
                                 drop_idx = ib
@@ -791,6 +991,8 @@ function MyClippings:mergeOverlappingKindleClippings()
     self.db.items = kept
     self._seen = nil
     self._seen_built = false
+    self._koreader_id_index = nil
+    self._koreader_id_built = false
     self:saveDB()
     return removed
 end
@@ -818,11 +1020,23 @@ end
 function MyClippings:regenerateOutputs()
     self._regen_scheduled = false
     self:dedupeExistingItems()
-    self:mergeOverlappingKindleClippings()
+    self:dedupeKoreaderEditsById()
+    self:mergeOverlappingHighlights(self:getMergeSourceFilter(), self:getMergeMaxDiffPercent() / 100)
     local dir = self:getOutputDir()
     local out_path = dir .. "/My Clippings.html"
     self:writeHTML(out_path)
     self:applyDefaultCoverIfMissing(out_path)
+end
+
+function MyClippings:mergeNow()
+    local before = #self.db.items
+    self:regenerateOutputs()
+    local removed = before - #self.db.items
+    UIManager:show(InfoMessage:new{
+        text = removed > 0 and T(_("Merged %1 overlapping highlight(s)."), removed)
+            or _("No overlapping highlights found with the current settings."),
+        timeout = 3,
+    })
 end
 
 local function htmlEscape(s)
@@ -981,37 +1195,112 @@ end
 
 -- ===================== Menu =====================
 
+-- Shared "Sources" / "Max difference" settings items, used both by the
+-- top-level "Merge overlapping highlights" group (which merges within the
+-- consolidated file/db) and by "Push highlights to current book" (which
+-- also merges the currently open book's real annotations) -- one setting,
+-- shown in both places rather than duplicated logic.
+function MyClippings:buildMergeSettingsMenuItems()
+    return {
+        {
+            text_func = function()
+                local f = self:getMergeSourceFilter()
+                return T(_("Sources: %1"), f == "kindle" and _("Kindle only")
+                    or f == "koreader" and _("KOReader only") or _("All"))
+            end,
+            sub_item_table = {
+                {
+                    text = _("All (any Kindle/KOReader pair)"),
+                    callback = function() self.settings:saveSetting("merge_source_filter", "all"); self.settings:flush() end,
+                },
+                {
+                    text = _("Kindle only (both sides from My Clippings.txt)"),
+                    callback = function() self.settings:saveSetting("merge_source_filter", "kindle"); self.settings:flush() end,
+                },
+                {
+                    text = _("KOReader only (both sides native highlights)"),
+                    callback = function() self.settings:saveSetting("merge_source_filter", "koreader"); self.settings:flush() end,
+                },
+            },
+        },
+        {
+            text_func = function()
+                return T(_("Max difference: %1%"), self:getMergeMaxDiffPercent())
+            end,
+            sub_item_table = {
+                { text = "5%", callback = function() self.settings:saveSetting("merge_max_diff_percent", 5); self.settings:flush() end },
+                { text = "8%", callback = function() self.settings:saveSetting("merge_max_diff_percent", 8); self.settings:flush() end },
+                { text = "15%", callback = function() self.settings:saveSetting("merge_max_diff_percent", 15); self.settings:flush() end },
+                { text = "25%", callback = function() self.settings:saveSetting("merge_max_diff_percent", 25); self.settings:flush() end },
+            },
+        },
+    }
+end
+
 function MyClippings:addToMainMenu(menu_items)
     menu_items.myclippings = {
         text = _("My Clippings Highlight Sync"),
         sorting_hint = "tools",
         sub_item_table = {
             {
-                text = _("Pull highlights from KOReader"),
-                keep_menu_open = true,
-                callback = function() self:pullFromKOReader() end,
+                text = _("Pull highlights"),
+                sub_item_table = {
+                    {
+                        text = _("Pull highlights from KOReader"),
+                        keep_menu_open = true,
+                        callback = function() self:pullFromKOReader() end,
+                    },
+                    {
+                        text = _("Pull highlights from Kindle (My Clippings)"),
+                        keep_menu_open = true,
+                        callback = function() self:pullFromKindle() end,
+                    },
+                    {
+                        text = _("Pull and merge highlights from all sources (tries all pulls then merges)"),
+                        keep_menu_open = true,
+                        callback = function() self:scanAndMerge() end,
+                    },
+                },
             },
             {
-                text = _("Pull highlights from Kindle (My Clippings)"),
-                keep_menu_open = true,
-                callback = function() self:pullFromKindle() end,
+                text = _("Merge overlapping highlights"),
+                sub_item_table = (function()
+                    local items = {
+                        {
+                            text = _("Merge now in My Clippings.html (with settings below)"),
+                            keep_menu_open = true,
+                            callback = function() self:mergeNow() end,
+                        },
+                    }
+                    for _, it in ipairs(self:buildMergeSettingsMenuItems()) do table.insert(items, it) end
+                    return items
+                end)(),
             },
             {
-                text = _("Pull and merge highlights from all sources (tries all pulls then merges)"),
-                keep_menu_open = true,
-                callback = function() self:scanAndMerge() end,
+                text = _("Push highlights to current book"),
+                sub_item_table = (function()
+                    local items = {
+                        {
+                            text = _("Push pending highlights (must have a book open)"),
+                            keep_menu_open = true,
+                            callback = function() self:pushToCurrentBook() end,
+                        },
+                        {
+                            text = _("Merge overlapping highlights in this book (must have a book open)"),
+                            keep_menu_open = true,
+                            callback = function() self:mergeAnnotationsInCurrentBook() end,
+                        },
+                    }
+                    for _, it in ipairs(self:buildMergeSettingsMenuItems()) do table.insert(items, it) end
+                    return items
+                end)(),
             },
             {
-                text = _("Push pending highlights to open book (must have a book open)"),
-                keep_menu_open = true,
-                callback = function() self:pushToCurrentBook() end,
-            },
-            {
-                text = _("Rebuild highlights file now"),
+                text = _("Rebuild My Clippings file"),
                 keep_menu_open = true,
                 callback = function()
                     self:regenerateOutputs()
-                    UIManager:show(InfoMessage:new{ text = _("Highlights file rebuilt."), timeout = 2 })
+                    UIManager:show(InfoMessage:new{ text = _("My Clippings file rebuilt."), timeout = 2 })
                 end,
             },
             {
