@@ -695,6 +695,106 @@ function MyClippings:dedupeExistingItems()
     return removed
 end
 
+local function normText(s)
+    return (s or ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
+end
+
+-- Classic O(n*m) edit distance -- fine here since it's only ever run on
+-- individual highlight-length strings, not full documents.
+local function levenshtein(a, b)
+    local la, lb = #a, #b
+    if la == 0 then return lb end
+    if lb == 0 then return la end
+    local prev = {}
+    for j = 0, lb do prev[j] = j end
+    for i = 1, la do
+        local cur = { [0] = i }
+        local ca = a:byte(i)
+        for j = 1, lb do
+            local cost = (ca == b:byte(j)) and 0 or 1
+            cur[j] = math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        end
+        prev = cur
+    end
+    return prev[lb]
+end
+
+local OVERLAP_MAX_DIFF_RATIO = 0.08 -- merge if the two texts differ by <8%
+
+-- True if two highlight texts look like the same passage captured with a
+-- slightly different boundary (Kindle re-highlighting the same spot a
+-- character or two off), not two genuinely different highlights.
+local function textsOverlap(a, b)
+    a, b = normText(a), normText(b)
+    if a == "" or b == "" then return false end
+    if a == b then return true end
+    if a:find(b, 1, true) or b:find(a, 1, true) then return true end
+    local maxlen = math.max(#a, #b)
+    if maxlen > 400 then return false end -- avoid O(n*m) blowup on long passages
+    return levenshtein(a, b) / maxlen <= OVERLAP_MAX_DIFF_RATIO
+end
+
+-- Collapses near-duplicate highlights within the same book -- but ONLY
+-- pairs where at least one side came from Kindle's My Clippings.txt, since
+-- that's the source that produces slightly-off-boundary re-captures of the
+-- same passage. Two KOReader-native highlights are left alone even if
+-- their text happens to overlap, since those are deliberate. Keeps
+-- whichever side has a real position (pos0) so the jump-link survives,
+-- otherwise keeps the longer text.
+function MyClippings:mergeOverlappingKindleClippings()
+    local canon = self:buildCanonicalBooks()
+    local by_book = {}
+    for idx, it in ipairs(self.db.items) do
+        local g = canon[it.book_path]
+        local key = g and g.key or (it.book_path or "?")
+        by_book[key] = by_book[key] or {}
+        table.insert(by_book[key], idx)
+    end
+
+    local to_remove = {}
+    for _, idxs in pairs(by_book) do
+        for a = 1, #idxs do
+            local ia = idxs[a]
+            if not to_remove[ia] then
+                for b = a + 1, #idxs do
+                    local ib = idxs[b]
+                    if not to_remove[ib] then
+                        local item_a = self.db.items[ia]
+                        local item_b = self.db.items[ib]
+                        if (item_a.source == "kindle" or item_b.source == "kindle")
+                            and textsOverlap(item_a.text, item_b.text) then
+                            local drop_idx
+                            if item_a.pos0 and not item_b.pos0 then
+                                drop_idx = ib
+                            elseif item_b.pos0 and not item_a.pos0 then
+                                drop_idx = ia
+                            elseif #(item_b.text or "") > #(item_a.text or "") then
+                                drop_idx = ia
+                            else
+                                drop_idx = ib
+                            end
+                            to_remove[drop_idx] = true
+                            if drop_idx == ia then break end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if next(to_remove) == nil then return 0 end
+    local kept = {}
+    for i, it in ipairs(self.db.items) do
+        if not to_remove[i] then table.insert(kept, it) end
+    end
+    local removed = #self.db.items - #kept
+    self.db.items = kept
+    self._seen = nil
+    self._seen_built = false
+    self:saveDB()
+    return removed
+end
+
 -- This plugin's own directory (wherever it was installed), so the bundled
 -- cover.png can be found regardless of the KOReader install path.
 local PLUGIN_DIR = debug.getinfo(1, "S").source:match("@(.*/)") or "./"
@@ -718,6 +818,7 @@ end
 function MyClippings:regenerateOutputs()
     self._regen_scheduled = false
     self:dedupeExistingItems()
+    self:mergeOverlappingKindleClippings()
     local dir = self:getOutputDir()
     local out_path = dir .. "/My Clippings.html"
     self:writeHTML(out_path)

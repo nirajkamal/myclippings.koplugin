@@ -37,6 +37,15 @@ they show up in other tools that read native KOReader highlights (e.g. the
 - **Output formatting** — grouped by book or by timeline (your choice),
   each highlight rendered as a styled quote block with a working "Open in
   book" link that jumps to the exact position.
+- **Merges overlapping Kindle re-captures** — Kindle sometimes records the
+  same passage twice with a slightly different boundary (a character or two
+  off at the start/end). On every rebuild, any pair of highlights in the
+  same book is automatically collapsed into one whenever at least one side
+  came from Kindle and the two texts either contain one another or differ
+  by less than ~8%, keeping whichever side has a real position (or the
+  longer text if neither does). Two KOReader-native highlights are never
+  merged this way, even if their text happens to overlap, since those are
+  deliberate.
 - **Configurable** — output folder (defaults to your KOReader home folder,
   overridable), font, and grouping mode, all from the plugin's menu.
 - **Cover** — the bundled `cover.png` is set as `My Clippings.html`'s custom
@@ -101,12 +110,10 @@ and run the push from within each one.
   common for books without fixed pagination) won't get a jump-link if they
   were never pushed into a real book, since there's nothing reliable to
   link to.
-- Near-duplicate highlights from adjusting a Kindle highlight's boundary
-  (several overlapping-but-not-identical text captures of the same
-  passage) are not automatically collapsed — only byte-identical
-  duplicates are deduped automatically, since automatically picking "the
-  right one" among overlapping variants risks discarding a highlight you
-  actually meant to keep.
+- Overlapping near-duplicates are only merged when at least one side is
+  Kindle-sourced (see Features above); two separately-made KOReader
+  highlights that happen to overlap are left as-is, since collapsing those
+  automatically risks discarding one you meant to keep.
 
 ## License
 
