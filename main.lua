@@ -145,15 +145,73 @@ local function normalizeTitle(s)
     return (s or ""):lower():gsub("[^%w]", "")
 end
 
--- Keyed on book title + exact highlight text, NOT book_path/page/datetime.
--- This matters because the same highlight can legitimately show up under two
--- different book_paths: the Kindle-Clippings pseudo-path ("clippings://...")
--- and, once pushToCurrentBook writes it into a real .sdr, the real epub path
--- too -- a later "Pull from KOReader" would otherwise see that real .sdr
--- entry as brand new and double-count it.
+-- True if two already-normalized titles should count as the same book:
+-- exact match, or one is a prefix of the other. Handles Kindle's Clippings
+-- title being the raw "Title Subtitle" run together with no punctuation,
+-- while an epub's own metadata title is often just the clean "Title" --
+-- an exact-equality check misses that entirely.
+local function titlesMatch(na, nb)
+    if na == "" or nb == "" then return false end
+    if na == nb then return true end
+    local shorter, longer = na, nb
+    if #na > #nb then shorter, longer = nb, na end
+    if #shorter < 6 then return false end -- avoid false positives on tiny titles
+    return longer:sub(1, #shorter) == shorter
+end
+
+-- Resolves every known book_path to one canonical {title=, author=, key=,
+-- norm=} record, grouping paths whose titles match per titlesMatch above.
+-- Real (non clippings://) paths are processed first and win as canonical,
+-- since that's actual book metadata; a Kindle-Clippings pseudo-path only
+-- supplies the title/author when no real path has claimed that group yet.
+-- Cheap enough (dozens of books) to just rebuild on demand, no caching.
+function MyClippings:buildCanonicalBooks()
+    local paths = {}
+    for path in pairs(self.db.books) do table.insert(paths, path) end
+    table.sort(paths, function(a, b)
+        local a_real, b_real = not a:match("^clippings://"), not b:match("^clippings://")
+        if a_real ~= b_real then return a_real end
+        return a < b
+    end)
+
+    local groups = {}
+    local path_to_group = {}
+    for _, path in ipairs(paths) do
+        local book = self.db.books[path]
+        local norm = normalizeTitle(book.title)
+        local matched
+        for _, g in ipairs(groups) do
+            if titlesMatch(norm, g.norm) then matched = g break end
+        end
+        if matched then
+            if matched.is_clippings and not path:match("^clippings://") then
+                matched.title, matched.author, matched.norm, matched.is_clippings =
+                    book.title, book.author, norm, false
+            end
+            path_to_group[path] = matched
+        else
+            local g = {
+                key = norm, title = book.title, author = book.author, norm = norm,
+                is_clippings = path:match("^clippings://") ~= nil,
+            }
+            table.insert(groups, g)
+            path_to_group[path] = g
+        end
+    end
+    return path_to_group
+end
+
+-- Keyed on the canonical book's title + exact highlight text, NOT
+-- book_path/page/datetime. This matters because the same highlight can
+-- legitimately show up under two different book_paths: the
+-- Kindle-Clippings pseudo-path ("clippings://...") and, once
+-- pushToCurrentBook writes it into a real .sdr, the real epub path too --
+-- a later "Pull from KOReader" would otherwise see that real .sdr entry as
+-- brand new and double-count it.
 function MyClippings:dedupeKey(item)
-    local book = self.db.books[item.book_path]
-    local title_key = book and normalizeTitle(book.title) or (item.book_path or "")
+    local canon = self:buildCanonicalBooks()
+    local group = canon[item.book_path]
+    local title_key = group and group.key or (item.book_path or "")
     return title_key .. "|" .. (item.text or "")
 end
 
@@ -536,11 +594,12 @@ function MyClippings:pushToCurrentBook()
         return
     end
 
+    local canon = self:buildCanonicalBooks()
     local pending = {}
     for _, it in ipairs(self.db.items) do
         if not it.pos0 then
-            local book = self.db.books[it.book_path] or {}
-            if normalizeTitle(book.title) == current_title then
+            local g = canon[it.book_path]
+            if g and titlesMatch(current_title, g.norm) then
                 table.insert(pending, it)
             end
         end
@@ -640,7 +699,7 @@ function MyClippings:regenerateOutputs()
     self._regen_scheduled = false
     self:dedupeExistingItems()
     local dir = self:getOutputDir()
-    self:writeHTML(dir .. "/My Highlights.html")
+    self:writeHTML(dir .. "/My Clippings.html")
 end
 
 local function htmlEscape(s)
@@ -691,30 +750,29 @@ function MyClippings:writeHTML(out_path)
     local font = self:getFontFamily()
     local mode = self:getGroupMode()
 
-    -- Grouped by normalized TITLE, not book_path: the same book can legitimately
-    -- have two paths in the db (the clippings:// pseudo-path for not-yet-pushed
-    -- items, and the real file path once some of its highlights are pushed) --
-    -- grouping by raw path would split one book into two headings.
+    -- Grouped via the canonical book map (titlesMatch-based, not exact-string
+    -- keying): the same book can legitimately show up under the clippings://
+    -- pseudo-path for not-yet-pushed items AND the real file path once some
+    -- highlights are pushed, with the two sides' titles not even matching
+    -- exactly (Kindle's raw "Title Subtitle" vs the epub's clean "Title").
+    local canon = self:buildCanonicalBooks()
     local by_book = {}
     local order = {}
     local group_book = {}
     for _, it in ipairs(self.db.items) do
-        local book = self.db.books[it.book_path] or {}
-        local key = normalizeTitle(book.title)
-        if not by_book[key] then
-            by_book[key] = {}
-            table.insert(order, key)
-            group_book[key] = book
-        elseif (not group_book[key].author or group_book[key].author == "") and book.author and book.author ~= "" then
-            group_book[key] = book -- prefer whichever variant actually has author info
+        local g = canon[it.book_path] or { key = it.book_path or "?", title = it.book_path, author = "" }
+        if not by_book[g.key] then
+            by_book[g.key] = {}
+            table.insert(order, g.key)
+            group_book[g.key] = g
         end
-        table.insert(by_book[key], it)
+        table.insert(by_book[g.key], it)
     end
 
     local html = {}
     local function put(s) table.insert(html, s) end
 
-    put('<!doctype html><html><head><meta charset="utf-8"><title>My Highlights</title><style>')
+    put('<!doctype html><html><head><meta charset="utf-8"><title>My Clippings</title><style>')
     put(string.format('body{font-family:%s;width:100%%;margin:0;padding:1em 4%%;line-height:1.5;color:#222;background:#fdfaf5;box-sizing:border-box;column-count:1;-webkit-column-count:1;columns:1;}', font))
     put('h1{font-size:1.6em;border-bottom:2px solid #333;padding-bottom:0.3em;}')
     put('h2{font-size:1.3em;margin-top:2em;color:#5a3e2b;border-bottom:1px solid #ccc;padding-bottom:0.2em;}')
@@ -724,14 +782,14 @@ function MyClippings:writeHTML(out_path)
     put('.meta a{color:#7a5c3e;text-decoration:underline;}')
     put('.chapter{font-size:0.78em;color:#a08060;}')
     put('nav{margin-bottom:2em;}nav a{display:block;margin:0.2em 0;color:#5a3e2b;text-decoration:none;}')
-    put('</style></head><body><h1>My Highlights</h1>')
+    put('</style></head><body><h1>My Clippings</h1>')
 
     if mode == "timeline" then
         local flat = {}
         for _, it in ipairs(self.db.items) do table.insert(flat, it) end
         table.sort(flat, function(a, b) return (a.datetime or "") > (b.datetime or "") end)
         for _, it in ipairs(flat) do
-            local book = self.db.books[it.book_path] or {}
+            local book = canon[it.book_path] or self.db.books[it.book_path] or {}
             local link = self:buildJumpLink(it)
             put('<blockquote>&ldquo;' .. htmlEscape(it.text) .. '&rdquo;')
             put('<div class="meta">' .. htmlEscape(book.title or "") ..
@@ -784,7 +842,7 @@ end
 
 function MyClippings:addToMainMenu(menu_items)
     menu_items.myclippings = {
-        text = _("Highlight Sync"),
+        text = _("My Clippings Highlight Sync"),
         sorting_hint = "tools",
         sub_item_table = {
             {
