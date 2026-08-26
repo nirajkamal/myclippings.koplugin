@@ -6,7 +6,7 @@ live-updating, nicely formatted **My Clippings.html** file. Every new
 highlight you make in KOReader gets appended automatically; a manual "pull"
 merges in anything from Kindle's clippings file too.
 
-![My Clippings shown in bookshelf.koplugin, alongside the rest of the library](screenshot.png)
+![My Clippings cover, applied automatically as the file's cover art](cover.png)
 
 ## Why
 
@@ -44,6 +44,10 @@ they show up in other tools that read native KOReader highlights (e.g. the
   in cover-grid views like `bookshelf.koplugin`'s. Pick a different cover
   yourself at any point (e.g. via bookshelf's own cover picker) and it's
   left alone from then on.
+
+Shown in `bookshelf.koplugin`'s home screen, alongside the rest of a library:
+
+![My Clippings shown in bookshelf.koplugin, alongside the rest of the library](screenshot.png)
 
 ## Installation
 
