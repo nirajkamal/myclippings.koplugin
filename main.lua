@@ -695,11 +695,33 @@ function MyClippings:dedupeExistingItems()
     return removed
 end
 
+-- This plugin's own directory (wherever it was installed), so the bundled
+-- cover.png can be found regardless of the KOReader install path.
+local PLUGIN_DIR = debug.getinfo(1, "S").source:match("@(.*/)") or "./"
+
+-- Sets the bundled cover.png as this output file's custom cover, but only if
+-- it doesn't already have one -- so a cover you later pick yourself via
+-- bookshelf.koplugin's own cover picker is never overwritten.
+function MyClippings:applyDefaultCoverIfMissing(out_path)
+    local ok_ds, DocSettings = pcall(require, "docsettings")
+    if not ok_ds then return end
+    local existing = DocSettings:findCustomCoverFile(out_path)
+    if existing then return end
+    local cover_path = PLUGIN_DIR .. "cover.png"
+    if lfs.attributes(cover_path, "mode") ~= "file" then return end
+    local ok_settings, settings = pcall(function() return DocSettings:open(out_path) end)
+    if ok_settings and settings then
+        pcall(function() settings:flushCustomCover(out_path, cover_path) end)
+    end
+end
+
 function MyClippings:regenerateOutputs()
     self._regen_scheduled = false
     self:dedupeExistingItems()
     local dir = self:getOutputDir()
-    self:writeHTML(dir .. "/My Clippings.html")
+    local out_path = dir .. "/My Clippings.html"
+    self:writeHTML(out_path)
+    self:applyDefaultCoverIfMissing(out_path)
 end
 
 local function htmlEscape(s)

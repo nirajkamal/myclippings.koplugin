@@ -2,9 +2,11 @@
 
 Consolidates highlights scattered across your reading setup — KOReader's own
 per-book annotations and Kindle's native `My Clippings.txt` — into one
-live-updating, nicely formatted **My Highlights.html** file. Every new
+live-updating, nicely formatted **My Clippings.html** file. Every new
 highlight you make in KOReader gets appended automatically; a manual "pull"
 merges in anything from Kindle's clippings file too.
+
+![My Clippings shown in bookshelf.koplugin, alongside the rest of the library](screenshot.png)
 
 ## Why
 
@@ -37,6 +39,11 @@ they show up in other tools that read native KOReader highlights (e.g. the
   book" link that jumps to the exact position.
 - **Configurable** — output folder (defaults to your KOReader home folder,
   overridable), font, and grouping mode, all from the plugin's menu.
+- **Cover** — the bundled `cover.png` is set as `My Clippings.html`'s custom
+  cover automatically the first time it's generated, so it shows up nicely
+  in cover-grid views like `bookshelf.koplugin`'s. Pick a different cover
+  yourself at any point (e.g. via bookshelf's own cover picker) and it's
+  left alone from then on.
 
 ## Installation
 
@@ -45,11 +52,11 @@ they show up in other tools that read native KOReader highlights (e.g. the
 2. Copy the whole `myclippings.koplugin` folder into your KOReader plugins
    directory (e.g. `koreader/plugins/`).
 3. Restart KOReader. It appears in the main menu under **Tools** (top level,
-   not nested under "More tools") as **Highlight Sync**.
+   not nested under "More tools") as **My Clippings Highlight Sync**.
 
 ## Usage
 
-Open **Tools → Highlight Sync**:
+Open **Tools → My Clippings Highlight Sync**:
 
 - **Pull highlights from KOReader** — merge in `.sdr` annotations.
 - **Pull highlights from Kindle (My Clippings)** — merge in
@@ -60,12 +67,12 @@ Open **Tools → Highlight Sync**:
   useful) while you have a book open; matches this book's pending
   Kindle-Clippings-sourced highlights against the actual text and writes
   real annotations for whatever matches.
-- **Rebuild highlights file now** — regenerates `My Highlights.html`
+- **Rebuild highlights file now** — regenerates `My Clippings.html`
   immediately (also runs an automatic dedup pass first).
 - **Group by: Book / Timeline** — toggles output grouping.
 - **Font** — Bookerly, Georgia, PT Serif, or sans-serif.
 - **Set custom output folder... / Use default home folder** — where
-  `My Highlights.html` is written.
+  `My Clippings.html` is written.
 
 ## Design notes / why no bulk push
 
