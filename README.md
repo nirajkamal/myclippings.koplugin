@@ -143,6 +143,14 @@ also collapses any duplicates left over from before this fix.
   highlights close together could theoretically be merged. Tune the Max
   Difference setting down, or restrict Sources, if this happens in your
   library.
+- Pushing can't find a Kindle-Clippings highlight whose text spans an
+  italicized (or otherwise inline-formatted) word or phrase in the book's
+  HTML — `<i>emphasis</i>` splits the sentence into separate text nodes,
+  and KOReader's `findAllText()` only matches within one contiguous text
+  run, not across them. The text matches perfectly once the tag is
+  stripped, but there's no reliable way to bridge that from here without
+  risking a highlight placed in the wrong spot, so these stay pending
+  rather than getting a guessed position.
 
 ## License
 

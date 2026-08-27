@@ -24,9 +24,50 @@ local MyClippings = WidgetContainer:extend{
 local REGEN_DEBOUNCE_SECONDS = 8
 local LINK_SCHEME = "hsjump"
 
+-- findAllText's search_flags (added in KOReader 2026.07, koreader#15543):
+-- passing MATCH_ACROSS_TEXT_NODES (0x0001) does let a search match text
+-- spanning an inline tag like <i> (which otherwise silently fails to find
+-- any highlight containing italicized text) -- but on this device/build it
+-- reproduced two separate KOReader crashes on the next page turn after a
+-- push that used it (getPageFromXPointer got a nil xpointer from somewhere
+-- in the annotation list, even though the newly-added ones were validated
+-- as real strings first). Reverted to the plain 5-arg call rather than
+-- keep debugging a crash blind on someone's device -- see README's Known
+-- limitations for the italics case this reintroduces. Left unused (not
+-- passed to findAllText below) rather than deleted, so it's easy to find
+-- and retry if this ever gets revisited.
+local FINDALL_SEARCH_FLAGS = 0x00FF
+
 -- Forward declarations: defined further down (near mergeOverlappingHighlights),
 -- but also needed by pushToCurrentBook, which comes earlier in the file.
 local normText, levenshtein, textsOverlap, sourcesQualifyForMerge
+
+local KINDLE_MONTHS = {
+    January = 1, February = 2, March = 3, April = 4, May = 5, June = 6,
+    July = 7, August = 8, September = 9, October = 10, November = 11, December = 12,
+}
+
+-- Kindle's clippings datetime ("Tuesday, August 4, 2026 12:52:19 AM") is
+-- NOT chronologically sortable as a plain string -- weekday/month names and
+-- unpadded numbers make lexicographic comparison meaningless. This converts
+-- it (when recognized) to a zero-padded "YYYY-MM-DD HH:MM:SS" key that
+-- sorts correctly; KOReader's own already-ISO-ish datetime passes through
+-- unchanged (it's sortable as-is), and anything unparseable falls back to
+-- the raw string rather than erroring.
+local function datetimeSortKey(s)
+    s = s or ""
+    local month, day, year, hour, min, sec, ampm =
+        s:match("%a+,%s*(%a+)%s+(%d+),%s+(%d+)%s+(%d+):(%d+):(%d+)%s*(%a*)")
+    if month and KINDLE_MONTHS[month] then
+        hour = tonumber(hour)
+        local upper_ampm = ampm:upper()
+        if upper_ampm == "PM" and hour < 12 then hour = hour + 12 end
+        if upper_ampm == "AM" and hour == 12 then hour = 0 end
+        return string.format("%04d-%02d-%02d %02d:%02d:%02d",
+            tonumber(year), KINDLE_MONTHS[month], tonumber(day), hour, tonumber(min), tonumber(sec))
+    end
+    return s
+end
 
 function MyClippings:init()
     self.settings = LuaSettings:open(
@@ -102,8 +143,77 @@ function MyClippings:getMergeMaxDiffPercent()
     return self.settings:readSetting("merge_max_diff_percent") or 8
 end
 
+function MyClippings:getExcludedFolders()
+    return self.settings:readSetting("excluded_folders") or {}
+end
+
+function MyClippings:addExcludedFolder(path)
+    path = path:gsub("/+$", "") -- normalize away a trailing slash
+    if path == "" then return end
+    local excluded = self:getExcludedFolders()
+    for _, p in ipairs(excluded) do
+        if p == path then return end -- already excluded
+    end
+    table.insert(excluded, path)
+    self.settings:saveSetting("excluded_folders", excluded)
+    self.settings:flush()
+end
+
+function MyClippings:removeExcludedFolder(path)
+    local excluded = self:getExcludedFolders()
+    for i, p in ipairs(excluded) do
+        if p == path then
+            table.remove(excluded, i)
+            break
+        end
+    end
+    self.settings:saveSetting("excluded_folders", excluded)
+    self.settings:flush()
+end
+
+-- True if book_path is inside (or is) one of the excluded folders.
+function MyClippings:isPathExcluded(path)
+    if not path then return false end
+    for _, folder in ipairs(self:getExcludedFolders()) do
+        if path == folder or path:sub(1, #folder + 1) == folder .. "/" then
+            return true
+        end
+    end
+    return false
+end
+
+-- Removes any already-ingested highlights/books whose path now falls under
+-- an excluded folder -- exclusion only stops future scans/live sync, so
+-- this is needed to actually clear out what's already in the db.
+function MyClippings:purgeExcludedItems()
+    local kept = {}
+    for _, it in ipairs(self.db.items) do
+        if not self:isPathExcluded(it.book_path) then
+            table.insert(kept, it)
+        end
+    end
+    local removed = #self.db.items - #kept
+    self.db.items = kept
+    for path in pairs(self.db.books) do
+        if self:isPathExcluded(path) then
+            self.db.books[path] = nil
+        end
+    end
+    if removed > 0 then
+        self._seen = nil
+        self._seen_built = false
+        self._koreader_id_index = nil
+        self._koreader_id_built = false
+        self:saveDB()
+    end
+    return removed
+end
+
 -- ===================== Persistent DB =====================
--- self.db = { books = { [path] = {title=, author=}, }, items = { {book_path=, page=, pos0=, pos1=, text=, datetime=, chapter=, source=}, ... } }
+-- self.db = { books = { [path] = {title=, author=}, }, items = { {book_path=, page=, location=, pos0=, pos1=, text=, note=, datetime=, chapter=, source=, is_note=}, ... } }
+-- is_note: true for a Kindle "Your Note" entry that couldn't be attached to
+-- a highlight (see scanMyClippings) -- text is the note's own content, not
+-- a quote from the book, and is rendered without quote-mark styling.
 
 function MyClippings:loadDB()
     local ok, data = pcall(dofile, self.db_path)
@@ -127,15 +237,18 @@ function MyClippings:saveDB()
     f:write("  },\n  items = {\n")
     for _, it in ipairs(self.db.items) do
         f:write(string.format(
-            "    { book_path = %q, page = %s, pos0 = %s, pos1 = %s, text = %q, datetime = %q, chapter = %q, source = %q },\n",
+            "    { book_path = %q, page = %s, location = %s, pos0 = %s, pos1 = %s, text = %q, note = %q, datetime = %q, chapter = %q, source = %q, is_note = %s },\n",
             it.book_path or "",
             self:serializeVal(it.page),
+            self:serializeVal(it.location),
             self:serializeVal(it.pos0),
             self:serializeVal(it.pos1),
             it.text or "",
+            it.note or "",
             it.datetime or "",
             it.chapter or "",
-            it.source or "koreader"
+            it.source or "koreader",
+            it.is_note and "true" or "false"
         ))
     end
     f:write("  },\n}\n")
@@ -255,6 +368,7 @@ function MyClippings:addItem(item)
         local existing = existing_idx and self.db.items[existing_idx]
         if existing then
             local changed = existing.text ~= item.text or existing.pos0 ~= item.pos0 or existing.pos1 ~= item.pos1
+                or existing.note ~= item.note
             for k, v in pairs(item) do existing[k] = v end
             if changed then self._seen_built = false end -- text changed, exact-match dedup cache is now stale
             return changed
@@ -319,6 +433,63 @@ function MyClippings:dedupeKoreaderEditsById()
     return removed
 end
 
+-- Retroactively re-attaches a standalone Kindle note (see scanMyClippings)
+-- to its highlight, for cases the live parse couldn't handle: the highlight
+-- was already in the db (so addItem silently skipped it as a duplicate and
+-- the in-memory "last highlight" tracking never got set), leaving a note
+-- edit stranded as its own item instead of overwriting the original note.
+-- Groups Kindle-sourced items in the same book by page/location: the
+-- earliest highlight in a group is the parent, the latest note is the
+-- corrected version (Kindle's export is append-only, so later = newer
+-- edit), and every standalone note in the group gets folded into it.
+function MyClippings:mergeStandaloneNotesIntoHighlights()
+    local canon = self:buildCanonicalBooks()
+    local groups = {}
+    for _, it in ipairs(self.db.items) do
+        if it.source == "kindle" then
+            local g = canon[it.book_path]
+            local bookkey = g and g.key or (it.book_path or "?")
+            local poskey = it.page or it.location
+            if poskey and poskey ~= "" then
+                local key = bookkey .. "|" .. poskey
+                groups[key] = groups[key] or { highlights = {}, notes = {} }
+                if it.is_note then
+                    table.insert(groups[key].notes, it)
+                else
+                    table.insert(groups[key].highlights, it)
+                end
+            end
+        end
+    end
+
+    local to_remove = {}
+    for _, g in pairs(groups) do
+        if #g.highlights > 0 and #g.notes > 0 then
+            table.sort(g.highlights, function(a, b) return datetimeSortKey(a.datetime) < datetimeSortKey(b.datetime) end)
+            local parent = g.highlights[1]
+            table.sort(g.notes, function(a, b) return datetimeSortKey(a.datetime) < datetimeSortKey(b.datetime) end)
+            parent.note = g.notes[#g.notes].text
+            for _, n in ipairs(g.notes) do
+                to_remove[n] = true
+            end
+        end
+    end
+
+    if next(to_remove) == nil then return 0 end
+    local kept = {}
+    for _, it in ipairs(self.db.items) do
+        if not to_remove[it] then table.insert(kept, it) end
+    end
+    local removed = #self.db.items - #kept
+    self.db.items = kept
+    self._seen = nil
+    self._seen_built = false
+    self._koreader_id_index = nil
+    self._koreader_id_built = false
+    self:saveDB()
+    return removed
+end
+
 -- ===================== Live sync: annotation event =====================
 
 function MyClippings:onAnnotationsModified(items)
@@ -329,6 +500,7 @@ function MyClippings:onAnnotationsModified(items)
     local props = self.ui.doc_props or {}
     local book_path = self.document and self.document.file or (self.ui.document and self.ui.document.file)
     if not book_path then return end
+    if self:isPathExcluded(book_path) then return end
 
     self.db.books[book_path] = {
         title = props.title or book_path:match("([^/]+)%.%w+$") or book_path,
@@ -341,6 +513,7 @@ function MyClippings:onAnnotationsModified(items)
         pos0 = type(item.pos0) == "string" and item.pos0 or nil,
         pos1 = type(item.pos1) == "string" and item.pos1 or nil,
         text = item.text,
+        note = item.note or "",
         datetime = item.datetime or os.date("%Y-%m-%d %H:%M:%S"),
         chapter = item.chapter or "",
         source = "koreader",
@@ -366,14 +539,14 @@ end
 function MyClippings:scanAndMerge()
     local home = self:getOutputDir()
     local count_sdr = self:scanSDR(home)
-    local count_clippings = self:scanMyClippings()
+    local count_clippings, count_notes = self:scanMyClippings()
 
     self:saveDB()
     self:regenerateOutputs()
 
     UIManager:show(InfoMessage:new{
-        text = T(_("Highlight scan complete.\nFrom KOReader highlights: %1\nFrom Kindle My Clippings.txt: %2\nTotal unique highlights: %3"),
-            count_sdr, count_clippings, #self.db.items),
+        text = T(_("Highlight scan complete.\nFrom KOReader highlights: %1\nFrom Kindle My Clippings.txt: %2 (%3 note(s))\nTotal unique highlights: %4"),
+            count_sdr, count_clippings, count_notes, #self.db.items),
     })
 end
 
@@ -388,11 +561,11 @@ function MyClippings:pullFromKOReader()
 end
 
 function MyClippings:pullFromKindle()
-    local count_clippings = self:scanMyClippings()
+    local count_clippings, count_notes = self:scanMyClippings()
     self:saveDB()
     self:regenerateOutputs()
     UIManager:show(InfoMessage:new{
-        text = T(_("Pulled %1 new highlight(s) from Kindle My Clippings.txt.\nTotal unique highlights: %2"), count_clippings, #self.db.items),
+        text = T(_("Pulled %1 new highlight(s) from Kindle My Clippings.txt (%2 note(s)).\nTotal unique highlights: %3"), count_clippings, count_notes, #self.db.items),
     })
 end
 
@@ -400,6 +573,7 @@ function MyClippings:scanSDR(root_dir)
     local found = 0
     local function scan_dir(dir, depth)
         if depth > 6 then return end
+        if self:isPathExcluded(dir) then return end
         local ok, iter, dir_obj = pcall(lfs.dir, dir)
         if not ok then return end
         for entry in iter, dir_obj do
@@ -442,6 +616,7 @@ function MyClippings:scanOneSDR(sdr_dir)
                             pos0 = type(ann.pos0) == "string" and ann.pos0 or nil,
                             pos1 = type(ann.pos1) == "string" and ann.pos1 or nil,
                             text = ann.text,
+                            note = ann.note or "",
                             datetime = ann.datetime or "",
                             chapter = ann.chapter or "",
                             source = "koreader",
@@ -471,6 +646,11 @@ function MyClippings:scanMyClippings()
     content = content:gsub("^\239\187\191", "")
 
     local found = 0
+    local notes_found = 0 -- Note entries seen, whether attached to a highlight or standalone
+    -- Kindle writes a "Your Note" entry right after the "Your Highlight" it
+    -- was made on, both from the same title -- tracked here so a Note gets
+    -- attached to that highlight instead of showing up as its own quote.
+    local last_highlight_by_book = {}
     for entry in (content .. "\n=========="):gmatch("(.-)\n==========") do
         local lines = {}
         for line in entry:gmatch("[^\n]+") do
@@ -480,29 +660,77 @@ function MyClippings:scanMyClippings()
         if #lines >= 2 then
             local title_line = lines[1]:gsub("^\239\187\191", "")
             local meta_line = lines[2]
-            local text = table.concat(lines, "\n", 3)
+            -- Kindle word-wraps a long highlight across multiple lines in
+            -- the plain-text export -- that's just its own line-wrapping,
+            -- not a real paragraph break in the book, so join with a space
+            -- (not "\n") or findAllText below will never match the actual
+            -- book text against an embedded newline that doesn't exist there.
+            local text = table.concat(lines, " ", 3)
             if text and text:match("%S") then
                 local title, author = title_line, ""
                 local t, a = title_line:match("^(.-)%s*%(([^%(%)]+)%)%s*%(%2%)$")
                 if not t then t, a = title_line:match("^(.-)%s*%(([^%(%)]+)%)$") end
                 if t then title, author = t, a end
                 local page = meta_line:match("page (%S+)")
+                local location = meta_line:match("Location (%S+)")
                 local date = meta_line:match("Added on (.+)$")
                 local pseudo_path = "clippings://" .. title
                 self.db.books[pseudo_path] = { title = title, author = author or "" }
-                local added = self:addItem({
-                    book_path = pseudo_path,
-                    page = page,
-                    text = text,
-                    datetime = date or "",
-                    chapter = "",
-                    source = "kindle",
-                })
-                if added then found = found + 1 end
+
+                -- meta_line reads e.g. "- Your Highlight on page 5 | Added on ..."
+                -- / "- Your Note on page 5 | ..." / "- Your Bookmark on page 5 | ...".
+                local entry_type = meta_line:match("Your (%a+)") or "Highlight"
+
+                if entry_type == "Bookmark" then
+                    -- not a highlight and not a note on one; nothing to keep
+                elseif entry_type == "Note" then
+                    local target = last_highlight_by_book[pseudo_path]
+                    if target then
+                        -- Kindle's export is append-only: editing a note
+                        -- doesn't rewrite its old entry, it appends a new
+                        -- one later in the file. So a later Note for the
+                        -- same highlight is an edit of the earlier one, not
+                        -- a second note -- overwrite, don't duplicate.
+                        target.note = text
+                        notes_found = notes_found + 1
+                    else
+                        local added = self:addItem({
+                            book_path = pseudo_path,
+                            page = page,
+                            location = location,
+                            text = text,
+                            note = "",
+                            datetime = date or "",
+                            chapter = "",
+                            source = "kindle",
+                            is_note = true,
+                        })
+                        if added then
+                            found = found + 1
+                            notes_found = notes_found + 1
+                        end
+                    end
+                else -- "Highlight" (or an unrecognized type -- treat as a highlight, the old behavior)
+                    local item = {
+                        book_path = pseudo_path,
+                        page = page,
+                        location = location,
+                        text = text,
+                        note = "",
+                        datetime = date or "",
+                        chapter = "",
+                        source = "kindle",
+                    }
+                    local added = self:addItem(item)
+                    if added then
+                        found = found + 1
+                        last_highlight_by_book[pseudo_path] = item
+                    end
+                end
             end
         end
     end
-    return found
+    return found, notes_found
 end
 
 -- ===================== Push highlights into real book sidecars =====================
@@ -592,11 +820,11 @@ function MyClippings:pushOneBook(DocumentRegistry, DocSettings, real_path, items
                     return doc:findAllText(it.text, false, 0, 1, false)
                 end)
                 local match = ok_search and results and results[1]
-                if match and match.start then
+                if match and type(match.start) == "string" then
                     table.insert(annotations, {
                         text = it.text,
                         pos0 = match.start,
-                        pos1 = match["end"] or match.start,
+                        pos1 = type(match["end"]) == "string" and match["end"] or match.start,
                         datetime = (it.datetime ~= "" and it.datetime) or os.date("%Y-%m-%d %H:%M:%S"),
                         drawer = "lighten",
                         chapter = it.chapter or "",
@@ -686,14 +914,16 @@ function MyClippings:pushToCurrentBook()
     -- Clean up first, so "pending" reflects merged/deduped state rather
     -- than pushing near-duplicate Kindle re-captures as separate
     -- highlights into the book.
+    self:fixEmbeddedNewlines()
     self:dedupeExistingItems()
     self:dedupeKoreaderEditsById()
+    self:mergeStandaloneNotesIntoHighlights()
     self:mergeOverlappingHighlights(self:getMergeSourceFilter(), self:getMergeMaxDiffPercent() / 100)
 
     local canon = self:buildCanonicalBooks()
     local pending = {}
     for _, it in ipairs(self.db.items) do
-        if not it.pos0 then
+        if not it.pos0 and not it.is_note then
             local g = canon[it.book_path]
             if g and titlesMatch(current_title, g.norm) then
                 table.insert(pending, it)
@@ -714,6 +944,7 @@ function MyClippings:pushToCurrentBook()
     local existing_annotations = (self.ui.annotation and self.ui.annotation.annotations) or {}
 
     local pushed, matched_existing, not_found = 0, 0, 0
+    local existing_mutated = false
     for _, it in ipairs(pending) do
         local already = nil
         for _, ann in ipairs(existing_annotations) do
@@ -733,19 +964,33 @@ function MyClippings:pushToCurrentBook()
                 title = props.title or real_path:match("([^/]+)%.%w+$") or real_path,
                 author = props.authors or props.author or "",
             }
+            -- Carry the Kindle note over onto the real annotation too, if it
+            -- doesn't already have one of its own.
+            if it.note and it.note ~= "" and (not already.note or already.note == "") then
+                already.note = it.note
+                existing_mutated = true
+            end
             matched_existing = matched_existing + 1
         else
             local ok_search, results = pcall(function()
                 return self.ui.document:findAllText(it.text, false, 0, 1, false)
             end)
             local match = ok_search and results and results[1]
-            if match and match.start then
+            -- Validate the match is a real xpointer string, not just
+            -- truthy: with MATCH_ACROSS_TEXT_NODES enabled, a hit spanning
+            -- multiple text nodes isn't guaranteed to come back as one --
+            -- an annotation with a malformed pos0 doesn't fail loudly here,
+            -- it crashes later (e.g. turning a page triggers KOReader's own
+            -- bookmark-dogear code to compare positions and choke on it).
+            if match and type(match.start) == "string" then
+                local pos1 = type(match["end"]) == "string" and match["end"] or match.start
                 local ok_add, index = pcall(function()
                     return self.ui.annotation:addItem({
                         page = match.start,
                         pos0 = match.start,
-                        pos1 = match["end"] or match.start,
+                        pos1 = pos1,
                         text = it.text,
+                        note = it.note or "",
                         datetime = (it.datetime ~= "" and it.datetime) or os.date("%Y-%m-%d %H:%M:%S"),
                         drawer = "lighten",
                         chapter = it.chapter or "",
@@ -754,7 +999,7 @@ function MyClippings:pushToCurrentBook()
                 if ok_add then
                     local real_path = self.ui.document.file
                     it.pos0 = match.start
-                    it.pos1 = match["end"] or match.start
+                    it.pos1 = pos1
                     it.book_path = real_path -- so its jump-link points at the real file, not the clippings:// pseudo-path
                     self.db.books[real_path] = self.db.books[real_path] or {
                         title = props.title or real_path:match("([^/]+)%.%w+$") or real_path,
@@ -764,7 +1009,7 @@ function MyClippings:pushToCurrentBook()
                     -- Track this new annotation so a later duplicate in the
                     -- same pending batch also matches against it, not just
                     -- what existed on disk before this push started.
-                    table.insert(existing_annotations, { text = it.text, pos0 = it.pos0, pos1 = it.pos1 })
+                    table.insert(existing_annotations, { text = it.text, pos0 = it.pos0, pos1 = it.pos1, note = it.note })
                     pcall(function()
                         self.ui:handleEvent(Event:new("AnnotationsModified",
                             { { page = match.start, pos0 = match.start, text = it.text }, nb_highlights_added = 1, index_modified = index }))
@@ -778,7 +1023,7 @@ function MyClippings:pushToCurrentBook()
         end
     end
 
-    if pushed > 0 then
+    if pushed > 0 or existing_mutated then
         pcall(function() self.ui.annotation:onSaveSettings() end)
     end
 
@@ -855,6 +1100,33 @@ function MyClippings:mergeAnnotationsInCurrentBook()
 end
 
 -- ===================== Output generation =====================
+
+-- One-time fix for highlights ingested before scanMyClippings joined
+-- Kindle's word-wrapped lines with a space instead of "\n" -- a highlight
+-- with an embedded newline never matches findAllText against the book's
+-- actual (space-separated) text, silently failing every push for it.
+-- Rewrites text/note in place; doesn't touch pos0/pos1 (any that were
+-- already linked stay linked -- only the stored text changes).
+function MyClippings:fixEmbeddedNewlines()
+    local fixed = 0
+    for _, it in ipairs(self.db.items) do
+        if it.text and it.text:find("\n", 1, true) then
+            it.text = it.text:gsub("\n", " ")
+            fixed = fixed + 1
+        end
+        if it.note and it.note:find("\n", 1, true) then
+            it.note = it.note:gsub("\n", " ")
+        end
+    end
+    if fixed > 0 then
+        self._seen = nil
+        self._seen_built = false
+        self._koreader_id_index = nil
+        self._koreader_id_built = false
+        self:saveDB()
+    end
+    return fixed
+end
 
 -- Removes exact duplicates (same normalized title + same exact text) that
 -- ended up in the db from before the dedup key fix, or from any other stray
@@ -973,6 +1245,15 @@ function MyClippings:mergeOverlappingHighlights(source_filter, max_diff_ratio)
                             else
                                 drop_idx = ib
                             end
+                            local keep_item = (drop_idx == ia) and item_b or item_a
+                            local drop_item = (drop_idx == ia) and item_a or item_b
+                            if drop_item.note and drop_item.note ~= "" then
+                                if not keep_item.note or keep_item.note == "" then
+                                    keep_item.note = drop_item.note
+                                elseif keep_item.note ~= drop_item.note then
+                                    keep_item.note = keep_item.note .. "\n---\n" .. drop_item.note
+                                end
+                            end
                             to_remove[drop_idx] = true
                             if drop_idx == ia then break end
                         end
@@ -1019,8 +1300,10 @@ end
 
 function MyClippings:regenerateOutputs()
     self._regen_scheduled = false
+    self:fixEmbeddedNewlines()
     self:dedupeExistingItems()
     self:dedupeKoreaderEditsById()
+    self:mergeStandaloneNotesIntoHighlights()
     self:mergeOverlappingHighlights(self:getMergeSourceFilter(), self:getMergeMaxDiffPercent() / 100)
     local dir = self:getOutputDir()
     local out_path = dir .. "/My Clippings.html"
@@ -1129,8 +1412,11 @@ function MyClippings:writeHTML(out_path)
     put('h1{font-size:1.6em;border-bottom:2px solid #333;padding-bottom:0.3em;}')
     put('h2{font-size:1.3em;margin-top:2em;color:#5a3e2b;border-bottom:1px solid #ccc;padding-bottom:0.2em;}')
     put('.author{font-size:0.85em;color:#777;font-style:italic;margin-top:-0.5em;margin-bottom:1em;}')
-    put('blockquote{margin:1em 0;padding:0.9em 1.1em;border-radius:14px;border:1px solid #ddc9ae;background:#f5efe4;font-style:normal;}')
+    put('blockquote{margin:1em 0;padding:0.9em 1.1em;border-radius:14px;border:1px solid #ddc9ae;background:#f5efe4;font-style:normal;page-break-inside:avoid;break-inside:avoid;}')
     put('.citation{font-size:0.7em;color:#a08060;font-style:italic;margin-top:0.4em;}')
+    put('.note{font-size:0.9em;color:#444;font-style:normal;margin-top:0.5em;padding-top:0.5em;border-top:1px dashed #ddc9ae;}')
+    put('.note-label{font-size:0.7em;font-weight:bold;color:#a08060;text-transform:uppercase;letter-spacing:0.05em;margin-right:0.4em;}')
+    put('.standalone-note{border-style:dashed;background:#faf7f0;}')
     put('.meta{font-size:0.75em;color:#999;margin-top:0.4em;font-style:normal;}')
     put('.meta a{color:#7a5c3e;text-decoration:underline;}')
     put('.chapter{font-size:0.78em;color:#a08060;}')
@@ -1140,11 +1426,18 @@ function MyClippings:writeHTML(out_path)
     if mode == "timeline" then
         local flat = {}
         for _, it in ipairs(self.db.items) do table.insert(flat, it) end
-        table.sort(flat, function(a, b) return (a.datetime or "") > (b.datetime or "") end)
+        table.sort(flat, function(a, b) return datetimeSortKey(a.datetime) > datetimeSortKey(b.datetime) end)
         for _, it in ipairs(flat) do
             local book = canon[it.book_path] or self.db.books[it.book_path] or {}
             local link = self:buildJumpLink(it)
-            put('<blockquote>&ldquo;' .. htmlEscape(it.text) .. '&rdquo;')
+            if it.is_note then
+                put('<blockquote class="standalone-note"><span class="note-label">Note</span><span class="quote-text">' .. htmlEscape(it.text) .. '</span>')
+            else
+                put('<blockquote>&ldquo;' .. htmlEscape(it.text) .. '&rdquo;')
+                if it.note and it.note ~= "" then
+                    put('<div class="note"><span class="note-label">Note</span>' .. htmlEscape(it.note) .. '</div>')
+                end
+            end
             put('<div class="citation">' .. htmlEscape(buildCitation(book.author, book.title)) .. '</div>')
             put('<div class="meta">' .. htmlEscape(book.title or "") ..
                 (it.chapter ~= "" and (' &middot; <span class="chapter">' .. htmlEscape(it.chapter) .. '</span>') or "") ..
@@ -1169,7 +1462,14 @@ function MyClippings:writeHTML(out_path)
             end
             for _, it in ipairs(by_book[key]) do
                 local link = self:buildJumpLink(it)
-                put('<blockquote>&ldquo;' .. htmlEscape(it.text) .. '&rdquo;')
+                if it.is_note then
+                    put('<blockquote class="standalone-note"><span class="note-label">Note</span><span class="quote-text">' .. htmlEscape(it.text) .. '</span>')
+                else
+                    put('<blockquote>&ldquo;' .. htmlEscape(it.text) .. '&rdquo;')
+                    if it.note and it.note ~= "" then
+                        put('<div class="note"><span class="note-label">Note</span>' .. htmlEscape(it.note) .. '</div>')
+                    end
+                end
                 put('<div class="citation">' .. htmlEscape(buildCitation(book.author, book.title)) .. '</div>')
                 put('<div class="meta">' ..
                     (it.chapter ~= "" and ('<span class="chapter">' .. htmlEscape(it.chapter) .. '</span> &middot; ') or "") ..
@@ -1341,6 +1641,35 @@ function MyClippings:addToMainMenu(menu_items)
                     UIManager:show(InfoMessage:new{ text = _("Output folder reset to home folder."), timeout = 2 })
                 end,
             },
+            {
+                text = _("Exclude a folder..."),
+                keep_menu_open = true,
+                callback = function() self:promptExcludeFolder() end,
+            },
+            {
+                text_func = function()
+                    local n = #self:getExcludedFolders()
+                    return n > 0 and T(_("Excluded folders (%1)"), n) or _("Excluded folders (none)")
+                end,
+                sub_item_table_func = function()
+                    local items = {}
+                    for _idx, folder in ipairs(self:getExcludedFolders()) do
+                        table.insert(items, {
+                            text = T(_("%1 (tap to remove)"), folder),
+                            keep_menu_open = true,
+                            callback = function()
+                                self:removeExcludedFolder(folder)
+                                self:regenerateOutputs()
+                                UIManager:show(InfoMessage:new{ text = T(_("No longer excluding: %1"), folder), timeout = 2 })
+                            end,
+                        })
+                    end
+                    if #items == 0 then
+                        table.insert(items, { text = _("No folders excluded."), select_enabled = false })
+                    end
+                    return items
+                end,
+            },
         },
     }
 end
@@ -1349,6 +1678,28 @@ function MyClippings:setFont(font)
     self.settings:saveSetting("font_family", font)
     self.settings:flush()
     self:regenerateOutputs()
+end
+
+function MyClippings:promptExcludeFolder()
+    local ok, PathChooser = pcall(require, "ui/widget/pathchooser")
+    if not ok then return end
+    local chooser = PathChooser:new{
+        path = self:getOutputDir(),
+        select_directory = true,
+        select_file = false,
+        onConfirm = function(path)
+            self:addExcludedFolder(path)
+            local removed = self:purgeExcludedItems()
+            self:regenerateOutputs()
+            UIManager:show(InfoMessage:new{
+                text = removed > 0
+                    and T(_("Excluding: %1\nRemoved %2 already-scanned highlight(s) from it."), path, removed)
+                    or T(_("Excluding: %1"), path),
+                timeout = 3,
+            })
+        end,
+    }
+    UIManager:show(chooser)
 end
 
 function MyClippings:promptOutputFolder()
