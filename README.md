@@ -52,6 +52,18 @@ they show up in other tools that read native KOReader highlights (e.g. the
   actually disappear from the book you're reading, not just from the
   consolidated file. Also runs automatically as part of pushing pending
   highlights into the open book.
+- **Highlight notes** — a note you attach to a highlight in KOReader is
+  captured and shown under the quote, and carried over when pushed into a
+  book's real annotations. A Kindle "Your Note" entry is folded into its
+  highlight automatically, including picking up the latest version if you
+  later edit that note in Kindle.
+- **Exclude folders** — stop a folder (e.g. a research-papers subfolder)
+  from ever being scanned or live-synced, and immediately purge anything
+  already pulled from it.
+- **Per-book recovery tools** — undo just what the plugin pushed into a
+  book, restore highlights the database already has a good position for
+  but which are missing from the book (e.g. after replacing the book
+  file), or wipe a book's highlights entirely for a clean re-push.
 - **Configurable** — output folder (defaults to your KOReader home folder,
   overridable), font, and grouping mode, all from the plugin's menu.
 - **Cover** — the bundled `cover.png` is set as `My Clippings.html`'s custom
@@ -83,11 +95,6 @@ Open **Tools → My Clippings Highlight Sync**:
     `My Clippings.txt`.
   - **Pull and merge highlights from all sources** — runs both pulls, then
     merges/dedupes.
-- **Merge overlapping highlights** — merges near-duplicates within
-  `My Clippings.html`/its underlying db.
-  - **Merge now** — runs immediately with the settings below.
-  - **Sources** — All / Kindle only / KOReader only.
-  - **Max difference** — 5% / 8% / 15% / 25%.
 - **Push highlights to current book** — only available (and only useful)
   while you have a book open.
   - **Push pending highlights** — matches this book's pending
@@ -96,13 +103,28 @@ Open **Tools → My Clippings Highlight Sync**:
     that already overlaps a highlight you have.
   - **Merge overlapping highlights in this book** — collapses duplicate
     highlight boxes already in the open book itself.
-  - Shares the same Sources / Max difference settings as above.
-- **Rebuild My Clippings file** — regenerates `My Clippings.html`
-  immediately (also runs the automatic dedup/merge passes first).
+  - **Advanced**
+    - **Undo pushed highlights in this book** — removes only what the
+      plugin added, unlinking them back to pending.
+    - **Delete ALL highlights in this book** — full reset (confirmation
+      required), including any you made natively.
+    - **Restore highlights already known to the database** — recreates
+      highlights the db has a good position for but which are missing
+      from the book itself (e.g. after replacing the book file).
+- **(Re)build My Clippings file from Highlights** — regenerates
+  `My Clippings.html` immediately (also runs the automatic dedup/merge
+  passes first).
 - **Group by: Book / Timeline** — toggles output grouping.
 - **Font** — Bookerly, Georgia, PT Serif, or sans-serif.
 - **Set custom output folder... / Use default home folder** — where
   `My Clippings.html` is written.
+- **Exclude a folder... / Excluded folders (N)** — stop a folder from
+  being scanned/synced, and manage current exclusions.
+- **Advanced: merge settings**
+  - **Merge now in My Clippings.html** — runs the overlap-merge
+    immediately with the settings below.
+  - **Sources** — All / Kindle only / KOReader only.
+  - **Max difference** — 5% / 8% / 15% / 25%.
 
 ## Design notes / why no bulk push
 
@@ -120,6 +142,23 @@ have open — since that document went through the normal flow, this uses
 the exact same code path KOReader's own in-book search does, with no crash
 risk observed. If you want highlights pushed into other books, open them
 and run the push from within each one.
+
+### Matching text across formatting and Kindle's line-wrapping
+
+Pushing/restoring needs to find a highlight's exact text in the book to
+get a real position. Two things used to break that silently:
+
+- Kindle word-wraps a long highlight across multiple lines in
+  `My Clippings.txt`; joining those with a literal newline embedded a
+  character that doesn't exist in the book's actual (space-separated)
+  text. Fixed by joining with a space instead — plus a one-time cleanup
+  for highlights already affected.
+- A highlight whose text crosses an italicized (or otherwise
+  inline-formatted) span — `<i>emphasis</i>` splits the sentence into
+  separate text nodes — used to never match, since `findAllText()`
+  defaults to matching within one contiguous text run. Passing KOReader's
+  own `MATCH_ACROSS_TEXT_NODES` search flag (the same flag its own in-book
+  search uses by default) fixes this.
 
 ### Why KOReader-native highlights used to duplicate on edit
 
@@ -143,6 +182,12 @@ also collapses any duplicates left over from before this fix.
   highlights close together could theoretically be merged. Tune the Max
   Difference setting down, or restrict Sources, if this happens in your
   library.
+- Pushing/restoring changes a book's real annotations, and KOReader has a
+  known issue where the *next page turn* right after that can crash the
+  app (unrelated to this plugin's own logic — it's in KOReader's
+  bookmark/dogear-visibility check). The plugin now prompts you to fully
+  close and reopen KOReader after any push or restore, before continuing
+  to read, which reliably avoids it.
 
 ## License
 
