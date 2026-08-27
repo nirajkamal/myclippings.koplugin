@@ -27,15 +27,15 @@ local LINK_SCHEME = "hsjump"
 -- findAllText's search_flags (added in KOReader 2026.07, koreader#15543):
 -- passing MATCH_ACROSS_TEXT_NODES (0x0001) does let a search match text
 -- spanning an inline tag like <i> (which otherwise silently fails to find
--- any highlight containing italicized text) -- but on this device/build it
--- reproduced two separate KOReader crashes on the next page turn after a
--- push that used it (getPageFromXPointer got a nil xpointer from somewhere
--- in the annotation list, even though the newly-added ones were validated
--- as real strings first). Reverted to the plain 5-arg call rather than
--- keep debugging a crash blind on someone's device -- see README's Known
--- limitations for the italics case this reintroduces. Left unused (not
--- passed to findAllText below) rather than deleted, so it's easy to find
--- and retry if this ever gets revisited.
+-- any highlight containing italicized text). First two attempts reproduced
+-- a KOReader crash on the next page turn after a push that used it
+-- (getPageFromXPointer got a nil xpointer from somewhere in the annotation
+-- list), but that book had several stale push sessions and edited
+-- highlights accumulated from earlier testing -- confounding the test.
+-- Re-enabled for a clean re-test on a book with a freshly wiped, from-
+-- scratch annotation list. If it crashes again on a clean book, revert to
+-- the plain 5-arg call (drop ", FINDALL_SEARCH_FLAGS" from both call sites
+-- below) and treat it as a real, reproducible incompatibility.
 local FINDALL_SEARCH_FLAGS = 0x00FF
 
 -- Forward declarations: defined further down (near mergeOverlappingHighlights),
@@ -817,7 +817,7 @@ function MyClippings:pushOneBook(DocumentRegistry, DocSettings, real_path, items
             local annotations = settings:readSetting("annotations") or {}
             for _, it in ipairs(items) do
                 local ok_search, results = pcall(function()
-                    return doc:findAllText(it.text, false, 0, 1, false)
+                    return doc:findAllText(it.text, false, 0, 1, false, FINDALL_SEARCH_FLAGS)
                 end)
                 local match = ok_search and results and results[1]
                 if match and type(match.start) == "string" then
@@ -948,7 +948,7 @@ function MyClippings:pushToCurrentBook()
     for _, it in ipairs(pending) do
         local already = nil
         for _, ann in ipairs(existing_annotations) do
-            if ann.text and textsOverlap(ann.text, it.text, max_diff_ratio) then
+            if ann.text and type(ann.pos0) == "string" and textsOverlap(ann.text, it.text, max_diff_ratio) then
                 already = ann
                 break
             end
@@ -957,7 +957,7 @@ function MyClippings:pushToCurrentBook()
         if already then
             local real_path = self.ui.document.file
             it.pos0 = already.pos0
-            it.pos1 = already.pos1
+            it.pos1 = type(already.pos1) == "string" and already.pos1 or already.pos0
             it.page = already.pos0
             it.book_path = real_path
             self.db.books[real_path] = self.db.books[real_path] or {
@@ -973,7 +973,7 @@ function MyClippings:pushToCurrentBook()
             matched_existing = matched_existing + 1
         else
             local ok_search, results = pcall(function()
-                return self.ui.document:findAllText(it.text, false, 0, 1, false)
+                return self.ui.document:findAllText(it.text, false, 0, 1, false, FINDALL_SEARCH_FLAGS)
             end)
             local match = ok_search and results and results[1]
             -- Validate the match is a real xpointer string, not just
@@ -1029,8 +1029,201 @@ function MyClippings:pushToCurrentBook()
 
     self:mergeOverlappingHighlights(self:getMergeSourceFilter(), max_diff_ratio)
     self:saveDB()
+    local msg = T(_("Pushed %1 new highlight(s) into this book (saved to disk).\n%2 already matched an existing highlight and were linked instead of duplicated.\n%3 not found verbatim in the text."), pushed, matched_existing, not_found)
+    if pushed > 0 or matched_existing > 0 then
+        msg = msg .. "\n\n" .. _("A known KOReader issue can crash the app on the next page turn right after annotations change. Please fully close and reopen KOReader now, before continuing to read.")
+    end
+    UIManager:show(InfoMessage:new{ text = msg })
+end
+
+-- Removes, from the currently open book's real annotations, only the ones
+-- this plugin itself pushed there (identified by matching pos0 against our
+-- own db) -- leaves any highlight you made natively in the book alone.
+-- Unlinks the corresponding db items back to "pending" so they can be
+-- pushed again later. Uses the same self.ui.annotation API pushing does,
+-- so KOReader itself handles the on-disk .sdr write correctly.
+-- Recreates highlights the db already has a real (already-linked) position
+-- for, but which are missing from this book's actual annotation list --
+-- e.g. after a .sdr got deleted/replaced outside the plugin, or a book file
+-- got swapped for a fresh copy. Uses the stored pos0/pos1 directly (no
+-- findAllText search needed, since we already trust that position), via
+-- the same annotation:addItem() API used everywhere else here.
+function MyClippings:restoreKnownHighlightsInCurrentBook()
+    if not self.ui or not self.ui.document or not self.ui.annotation then
+        UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
+        return
+    end
+    local real_path = self.ui.document.file
+
+    local existing_pos0 = {}
+    for _, ann in ipairs(self.ui.annotation.annotations) do
+        if type(ann.pos0) == "string" then existing_pos0[ann.pos0] = true end
+    end
+
+    local restored, skipped, already_present = 0, 0, 0
+    for _, it in ipairs(self.db.items) do
+        if it.book_path == real_path and type(it.pos0) == "string" then
+          if existing_pos0[it.pos0] then
+            already_present = already_present + 1
+          else
+            local ok_add = pcall(function()
+                self.ui.annotation:addItem({
+                    page = it.pos0,
+                    pos0 = it.pos0,
+                    pos1 = type(it.pos1) == "string" and it.pos1 or it.pos0,
+                    text = it.text,
+                    note = it.note or "",
+                    datetime = (it.datetime ~= "" and it.datetime) or os.date("%Y-%m-%d %H:%M:%S"),
+                    drawer = "lighten",
+                    chapter = it.chapter or "",
+                })
+            end)
+            if ok_add then
+                restored = restored + 1
+                existing_pos0[it.pos0] = true
+            else
+                skipped = skipped + 1
+            end
+          end
+        end
+    end
+
+    if restored > 0 then
+        pcall(function() self.ui.annotation:onSaveSettings() end)
+    end
+
+    local msg = T(_("Restored %1 highlight(s) already known to the database.\n%2 already present in this book.\n%3 failed to restore."), restored, already_present, skipped)
+    if restored > 0 then
+        msg = msg .. "\n\n" .. _("A known KOReader issue can crash the app on the next page turn right after annotations change. Please fully close and reopen KOReader now, before continuing to read.")
+    end
+    UIManager:show(InfoMessage:new{ text = msg })
+end
+
+function MyClippings:unpushFromCurrentBook()
+    if not self.ui or not self.ui.document or not self.ui.annotation then
+        UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
+        return
+    end
+    local real_path = self.ui.document.file
+
+    local pushed_pos0 = {}
+    for _, it in ipairs(self.db.items) do
+        if it.source == "kindle" and it.book_path == real_path and it.pos0 then
+            pushed_pos0[it.pos0] = true
+        end
+    end
+    if next(pushed_pos0) == nil then
+        UIManager:show(InfoMessage:new{ text = _("No pushed highlights found for this book.") })
+        return
+    end
+
+    local annotations = self.ui.annotation.annotations
+    local removed = 0
+    for i = #annotations, 1, -1 do
+        if pushed_pos0[annotations[i].pos0] then
+            table.remove(annotations, i)
+            removed = removed + 1
+        end
+    end
+    if removed > 0 then
+        pcall(function() self.ui.annotation:onSaveSettings() end)
+    end
+
+    local canon = self:buildCanonicalBooks()
+    local pseudo_path
+    local g = canon[real_path]
+    if g then
+        for path, book in pairs(self.db.books) do
+            if path:match("^clippings://") and titlesMatch(normalizeTitle(book.title), g.norm) then
+                pseudo_path = path
+                break
+            end
+        end
+    end
+
+    local unlinked = 0
+    for _, it in ipairs(self.db.items) do
+        if it.source == "kindle" and it.book_path == real_path and pushed_pos0[it.pos0] then
+            it.pos0 = nil
+            it.pos1 = nil
+            it.page = nil
+            if pseudo_path then it.book_path = pseudo_path end
+            unlinked = unlinked + 1
+        end
+    end
+    self._seen = nil
+    self._seen_built = false
+    self._koreader_id_index = nil
+    self._koreader_id_built = false
+    self:saveDB()
+
     UIManager:show(InfoMessage:new{
-        text = T(_("Pushed %1 new highlight(s) into this book (saved to disk).\n%2 already matched an existing highlight and were linked instead of duplicated.\n%3 not found verbatim in the text."), pushed, matched_existing, not_found),
+        text = T(_("Removed %1 pushed highlight(s) from this book and unlinked %2 db item(s) back to pending."), removed, unlinked),
+    })
+end
+
+-- Wipes EVERY annotation in the currently open book -- native highlights
+-- included, not just ones this plugin pushed. Only reachable from a
+-- dedicated menu item with a confirmation dialog; there's no scoped
+-- undo for this one. Unlinks every Kindle-sourced db item pointing at this
+-- book back to pending, so a fresh Pull+Push can repopulate it from
+-- My Clippings.txt.
+function MyClippings:clearAllAnnotationsInCurrentBook()
+    if not self.ui or not self.ui.document or not self.ui.annotation then
+        UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
+        return
+    end
+    local real_path = self.ui.document.file
+    local count = #self.ui.annotation.annotations
+
+    for i = #self.ui.annotation.annotations, 1, -1 do
+        table.remove(self.ui.annotation.annotations, i)
+    end
+    pcall(function() self.ui.annotation:onSaveSettings() end)
+
+    local canon = self:buildCanonicalBooks()
+    local pseudo_path
+    local g = canon[real_path]
+    if g then
+        for path, book in pairs(self.db.books) do
+            if path:match("^clippings://") and titlesMatch(normalizeTitle(book.title), g.norm) then
+                pseudo_path = path
+                break
+            end
+        end
+    end
+
+    local unlinked = 0
+    for _, it in ipairs(self.db.items) do
+        if it.source == "kindle" and it.book_path == real_path then
+            it.pos0 = nil
+            it.pos1 = nil
+            it.page = nil
+            if pseudo_path then it.book_path = pseudo_path end
+            unlinked = unlinked + 1
+        end
+    end
+    self._seen = nil
+    self._seen_built = false
+    self._koreader_id_index = nil
+    self._koreader_id_built = false
+    self:saveDB()
+
+    UIManager:show(InfoMessage:new{
+        text = T(_("Cleared %1 annotation(s) from this book and unlinked %2 db item(s) back to pending."), count, unlinked),
+    })
+end
+
+function MyClippings:confirmClearAllAnnotationsInCurrentBook()
+    if not self.ui or not self.ui.document then
+        UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
+        return
+    end
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = _("Delete ALL highlights in this book -- including any you made natively, not just pushed ones? This can't be undone from here; Kindle-sourced ones can be re-pushed afterward."),
+        ok_text = _("Delete all"),
+        ok_callback = function() self:clearAllAnnotationsInCurrentBook() end,
     })
 end
 
@@ -1563,40 +1756,42 @@ function MyClippings:addToMainMenu(menu_items)
                 },
             },
             {
-                text = _("Merge overlapping highlights"),
-                sub_item_table = (function()
-                    local items = {
-                        {
-                            text = _("Merge now in My Clippings.html (with settings below)"),
-                            keep_menu_open = true,
-                            callback = function() self:mergeNow() end,
-                        },
-                    }
-                    for _, it in ipairs(self:buildMergeSettingsMenuItems()) do table.insert(items, it) end
-                    return items
-                end)(),
-            },
-            {
                 text = _("Push highlights to current book"),
-                sub_item_table = (function()
-                    local items = {
-                        {
-                            text = _("Push pending highlights (must have a book open)"),
-                            keep_menu_open = true,
-                            callback = function() self:pushToCurrentBook() end,
+                sub_item_table = {
+                    {
+                        text = _("Push pending highlights (must have a book open)"),
+                        keep_menu_open = true,
+                        callback = function() self:pushToCurrentBook() end,
+                    },
+                    {
+                        text = _("Merge overlapping highlights in this book (must have a book open)"),
+                        keep_menu_open = true,
+                        callback = function() self:mergeAnnotationsInCurrentBook() end,
+                    },
+                    {
+                        text = _("Advanced"),
+                        sub_item_table = {
+                            {
+                                text = _("Undo pushed highlights in this book (must have a book open)"),
+                                keep_menu_open = true,
+                                callback = function() self:unpushFromCurrentBook() end,
+                            },
+                            {
+                                text = _("Delete ALL highlights in this book (must have a book open)"),
+                                keep_menu_open = true,
+                                callback = function() self:confirmClearAllAnnotationsInCurrentBook() end,
+                            },
+                            {
+                                text = _("Restore highlights already known to the database (must have a book open)"),
+                                keep_menu_open = true,
+                                callback = function() self:restoreKnownHighlightsInCurrentBook() end,
+                            },
                         },
-                        {
-                            text = _("Merge overlapping highlights in this book (must have a book open)"),
-                            keep_menu_open = true,
-                            callback = function() self:mergeAnnotationsInCurrentBook() end,
-                        },
-                    }
-                    for _, it in ipairs(self:buildMergeSettingsMenuItems()) do table.insert(items, it) end
-                    return items
-                end)(),
+                    },
+                },
             },
             {
-                text = _("Rebuild My Clippings file"),
+                text = _("(Re)build My Clippings file from Highlights"),
                 keep_menu_open = true,
                 callback = function()
                     self:regenerateOutputs()
@@ -1669,6 +1864,20 @@ function MyClippings:addToMainMenu(menu_items)
                     end
                     return items
                 end,
+            },
+            {
+                text = _("Advanced: merge settings"),
+                sub_item_table = (function()
+                    local items = {
+                        {
+                            text = _("Merge now in My Clippings.html (with settings below)"),
+                            keep_menu_open = true,
+                            callback = function() self:mergeNow() end,
+                        },
+                    }
+                    for _, it in ipairs(self:buildMergeSettingsMenuItems()) do table.insert(items, it) end
+                    return items
+                end)(),
             },
         },
     }
