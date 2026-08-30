@@ -898,6 +898,22 @@ end
 -- the normal reader flow, unlike a bare DocumentRegistry:openDocument) and
 -- self.ui.annotation:addItem -- the exact same path a real highlight takes.
 -- No headless document opens, no crash risk we've seen so far.
+-- Being a non-empty string isn't enough to trust an xpointer: with
+-- MATCH_ACROSS_TEXT_NODES enabled, findAllText can return a match spanning
+-- multiple text nodes whose start position is a syntactically valid string
+-- that still doesn't resolve to a real page. ReaderAnnotation:addItem()
+-- calls getPageFromXPointer() on it internally and silently accepts nil,
+-- leaving a highlight with page=nil in the .sdr -- which doesn't crash
+-- until later (turning a page, or opening the Bookmarks list). Calling the
+-- same resolution ourselves first and rejecting anything that doesn't
+-- resolve closes that off before it's ever written.
+function MyClippings:xpointerResolvesToPage(xpointer)
+    local ok, page = pcall(function()
+        return self.ui.document:getPageFromXPointer(xpointer)
+    end)
+    return ok and page ~= nil
+end
+
 function MyClippings:pushToCurrentBook()
     if not self.ui or not self.ui.document or not self.ui.annotation then
         UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
@@ -948,7 +964,8 @@ function MyClippings:pushToCurrentBook()
     for _, it in ipairs(pending) do
         local already = nil
         for _, ann in ipairs(existing_annotations) do
-            if ann.text and type(ann.pos0) == "string" and textsOverlap(ann.text, it.text, max_diff_ratio) then
+            if ann.text and type(ann.pos0) == "string" and self:xpointerResolvesToPage(ann.pos0)
+                and textsOverlap(ann.text, it.text, max_diff_ratio) then
                 already = ann
                 break
             end
@@ -982,7 +999,7 @@ function MyClippings:pushToCurrentBook()
             -- an annotation with a malformed pos0 doesn't fail loudly here,
             -- it crashes later (e.g. turning a page triggers KOReader's own
             -- bookmark-dogear code to compare positions and choke on it).
-            if match and type(match.start) == "string" then
+            if match and type(match.start) == "string" and self:xpointerResolvesToPage(match.start) then
                 local pos1 = type(match["end"]) == "string" and match["end"] or match.start
                 local ok_add, index = pcall(function()
                     return self.ui.annotation:addItem({
@@ -1060,10 +1077,12 @@ function MyClippings:restoreKnownHighlightsInCurrentBook()
         if type(ann.pos0) == "string" then existing_pos0[ann.pos0] = true end
     end
 
-    local restored, skipped, already_present = 0, 0, 0
+    local restored, skipped, already_present, unresolvable = 0, 0, 0, 0
     for _, it in ipairs(self.db.items) do
-        if it.book_path == real_path and type(it.pos0) == "string" then
-          if existing_pos0[it.pos0] then
+        if it.book_path == real_path and type(it.pos0) == "string" and it.pos0 ~= "" then
+          if not self:xpointerResolvesToPage(it.pos0) then
+            unresolvable = unresolvable + 1
+          elseif existing_pos0[it.pos0] then
             already_present = already_present + 1
           else
             local ok_add = pcall(function()
@@ -1092,7 +1111,7 @@ function MyClippings:restoreKnownHighlightsInCurrentBook()
         pcall(function() self.ui.annotation:onSaveSettings() end)
     end
 
-    local msg = T(_("Restored %1 highlight(s) already known to the database.\n%2 already present in this book.\n%3 failed to restore."), restored, already_present, skipped)
+    local msg = T(_("Restored %1 highlight(s) already known to the database.\n%2 already present in this book.\n%3 failed to restore.\n%4 skipped (position no longer resolves in this book)."), restored, already_present, skipped, unresolvable)
     if restored > 0 then
         msg = msg .. "\n\n" .. _("A known KOReader issue can crash the app on the next page turn right after annotations change. Please fully close and reopen KOReader now, before continuing to read.")
     end
@@ -1237,6 +1256,76 @@ end
 -- just from the consolidated file. Source-blind: once pushed, a highlight
 -- has no record of whether it came from Kindle or KOReader, so this
 -- compares every pair by text overlap only.
+-- Self-service fix for a v1.0.3 bug: pushing/restoring a highlight whose
+-- match crossed formatted text (MATCH_ACROSS_TEXT_NODES) could accept a
+-- position that's a valid string but doesn't actually resolve to a page,
+-- silently writing a broken highlight that crashes KOReader later when
+-- something reads its page (opening the Bookmarks list, turning a page).
+-- Removes any such broken entries from the book's real annotations and
+-- unlinks the matching db item back to pending, so pushing it again (now
+-- validated) can safely recover it.
+function MyClippings:repairBrokenAnnotationsInCurrentBook()
+    if not self.ui or not self.ui.document or not self.ui.annotation then
+        UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
+        return
+    end
+    local real_path = self.ui.document.file
+    local anns = self.ui.annotation.annotations
+
+    local removed_texts = {}
+    for i = #anns, 1, -1 do
+        local ann = anns[i]
+        local pos0_ok = type(ann.pos0) == "string" and self:xpointerResolvesToPage(ann.pos0)
+        local page_ok = type(ann.page) == "string" and self:xpointerResolvesToPage(ann.page)
+        if not pos0_ok and not page_ok then
+            table.insert(removed_texts, ann.text or "")
+            table.remove(anns, i)
+        end
+    end
+    local removed = #removed_texts
+
+    if removed > 0 then
+        pcall(function() self.ui.annotation:onSaveSettings() end)
+    end
+
+    local unlinked = 0
+    if removed > 0 then
+        local removed_set = {}
+        for _, t in ipairs(removed_texts) do removed_set[t] = true end
+        local canon = self:buildCanonicalBooks()
+        local pseudo_path
+        local g = canon[real_path]
+        if g then
+            for path, book in pairs(self.db.books) do
+                if path:match("^clippings://") and titlesMatch(normalizeTitle(book.title), g.norm) then
+                    pseudo_path = path
+                    break
+                end
+            end
+        end
+        for _, it in ipairs(self.db.items) do
+            if it.book_path == real_path and removed_set[it.text] then
+                it.pos0 = nil
+                it.pos1 = nil
+                it.page = nil
+                if pseudo_path then it.book_path = pseudo_path end
+                unlinked = unlinked + 1
+            end
+        end
+        self._seen = nil
+        self._seen_built = false
+        self._koreader_id_index = nil
+        self._koreader_id_built = false
+        self:saveDB()
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = removed > 0
+            and T(_("Removed %1 broken highlight(s) from this book (position couldn't be resolved) and unlinked %2 back to pending. Push again to safely recover them."), removed, unlinked)
+            or _("No broken highlights found in this book."),
+    })
+end
+
 function MyClippings:mergeAnnotationsInCurrentBook()
     if not self.ui or not self.ui.annotation or not self.ui.highlight then
         UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
@@ -1785,6 +1874,11 @@ function MyClippings:addToMainMenu(menu_items)
                                 text = _("Restore highlights already known to the database (must have a book open)"),
                                 keep_menu_open = true,
                                 callback = function() self:restoreKnownHighlightsInCurrentBook() end,
+                            },
+                            {
+                                text = _("Repair broken highlights in this book (fixes a v1.0.3 crash bug, must have a book open)"),
+                                keep_menu_open = true,
+                                callback = function() self:repairBrokenAnnotationsInCurrentBook() end,
                             },
                         },
                     },

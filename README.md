@@ -111,6 +111,10 @@ Open **Tools → My Clippings Highlight Sync**:
     - **Restore highlights already known to the database** — recreates
       highlights the db has a good position for but which are missing
       from the book itself (e.g. after replacing the book file).
+    - **Repair broken highlights in this book** — fixes a v1.0.3 crash bug
+      (see [Design notes](#matching-text-across-formatting-and-kindles-line-wrapping)):
+      removes only highlights whose position doesn't actually resolve and
+      unlinks them back to pending for a safe re-push.
 - **(Re)build My Clippings file from Highlights** — regenerates
   `My Clippings.html` immediately (also runs the automatic dedup/merge
   passes first).
@@ -158,7 +162,16 @@ get a real position. Two things used to break that silently:
   separate text nodes — used to never match, since `findAllText()`
   defaults to matching within one contiguous text run. Passing KOReader's
   own `MATCH_ACROSS_TEXT_NODES` search flag (the same flag its own in-book
-  search uses by default) fixes this.
+  search uses by default) fixes this — but that flag introduced its own
+  problem: a cross-node match's position can be a syntactically valid
+  string that still doesn't resolve to a real page, and v1.0.3 accepted it
+  anyway, writing a broken highlight that crashed KOReader later (opening
+  the Bookmarks list, or turning a page). Fixed in v1.0.4 by confirming a
+  position actually resolves before ever writing it. **If you used
+  Push/Restore on v1.0.3 and hit a crash like this**, open the affected
+  book and run Push highlights to current book → Advanced → "Repair
+  broken highlights in this book" — it removes only the broken entries and
+  unlinks them back to pending so a fresh push recovers them safely.
 
 ### Why KOReader-native highlights used to duplicate on edit
 

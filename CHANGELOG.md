@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.0.4
+
+- **Fixes a v1.0.3 bug that could crash KOReader** when opening the
+  Bookmarks list or turning a page, for anyone who used Push/Restore on a
+  highlight whose match crossed formatted text (e.g. an italicized word).
+  A cross-node match could return a position that's a valid string but
+  doesn't actually resolve to a page — accepted as valid before, now
+  rejected. Push, the existing-highlight linking check, and Restore all
+  now confirm a position genuinely resolves before writing it.
+- **New: "Repair broken highlights in this book"**, under Push highlights
+  to current book → Advanced. If you already hit this crash on a book,
+  open it and run this — it removes only the broken entries (not your
+  other highlights) and unlinks the matching database items back to
+  pending, so pushing again safely recovers them.
+
 ## v1.0.3
 
 - **Highlight notes**: a note you attach to a KOReader highlight is now
