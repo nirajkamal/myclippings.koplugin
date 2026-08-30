@@ -1973,6 +1973,18 @@ function MyClippings:addToMainMenu(menu_items)
                     return items
                 end)(),
             },
+            {
+                text = _("Check for updates..."),
+                keep_menu_open = true,
+                callback = function()
+                    local ok, Updater = pcall(require, "myclippings_updater")
+                    if ok then
+                        Updater.check()
+                    else
+                        UIManager:show(InfoMessage:new{ text = _("Update checker unavailable.") })
+                    end
+                end,
+            },
         },
     }
 end

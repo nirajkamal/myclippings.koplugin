@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.0.5
+
+- **"Check for updates..."** — new menu action (bottom of the plugin's
+  menu) that checks this repo's latest GitHub release against the
+  installed version, shows the release notes if one is newer, and can
+  download and install it in place (restarts KOReader when done). Same
+  approach `bookshelf.koplugin` uses, trimmed down to just "check now" /
+  "update now" (no background auto-check, no dev branches).
+- `_meta.lua` now carries a `version` field, needed for the above to know
+  what's currently installed.
+
 ## v1.0.4
 
 - **Fixes a v1.0.3 bug that could crash KOReader** when opening the

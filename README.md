@@ -129,6 +129,9 @@ Open **Tools → My Clippings Highlight Sync**:
     immediately with the settings below.
   - **Sources** — All / Kindle only / KOReader only.
   - **Max difference** — 5% / 8% / 15% / 25%.
+- **Check for updates...** — checks this repo's latest release against the
+  installed version; if newer, shows the release notes with an option to
+  download and install it in place (restarts KOReader afterward).
 
 ## Design notes / why no bulk push
 
