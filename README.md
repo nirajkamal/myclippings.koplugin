@@ -189,6 +189,10 @@ also collapses any duplicates left over from before this fix.
 
 ## Known limitations
 
+- Push and Restore only work on reflowable documents (EPUB, FB2, HTML,
+  TXT) — refused outright on paging documents (PDF, CBZ, DjVu), since
+  those use a different backend and position model this feature was never
+  tested against.
 - Kindle Clippings entries with only a `Location` number (no page number,
   common for books without fixed pagination) won't get a jump-link if they
   were never pushed into a real book, since there's nothing reliable to

@@ -919,6 +919,20 @@ function MyClippings:pushToCurrentBook()
         UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
         return
     end
+    if not self.ui.rolling then
+        -- Everything here (findAllText, getPageFromXPointer, xpointer
+        -- strings as positions) is built around reflowable/rolling
+        -- documents (EPUB, FB2, HTML, TXT) via crengine. A paging document
+        -- (PDF, CBZ, DjVu) uses a completely different backend (mupdf) and
+        -- position model that's never been tested with this feature, and a
+        -- user reported a book becoming unopenable ("No reader engine for
+        -- this file or invalid file") after pushing to it -- plausibly
+        -- exactly this mismatch. Refuse rather than risk it.
+        UIManager:show(InfoMessage:new{
+            text = _("Pushing highlights isn't supported for this document type (only reflowable formats like EPUB, FB2, HTML, and TXT)."),
+        })
+        return
+    end
 
     local props = self.ui.doc_props or {}
     local current_title = normalizeTitle(props.title)
@@ -1068,6 +1082,12 @@ end
 function MyClippings:restoreKnownHighlightsInCurrentBook()
     if not self.ui or not self.ui.document or not self.ui.annotation then
         UIManager:show(InfoMessage:new{ text = _("Open a book first.") })
+        return
+    end
+    if not self.ui.rolling then
+        UIManager:show(InfoMessage:new{
+            text = _("Restoring highlights isn't supported for this document type (only reflowable formats like EPUB, FB2, HTML, and TXT)."),
+        })
         return
     end
     local real_path = self.ui.document.file

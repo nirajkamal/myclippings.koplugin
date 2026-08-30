@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.0.6
+
+- **Restricted push/restore to reflowable documents only** (EPUB, FB2,
+  HTML, TXT). A user reported a book becoming unopenable ("No reader
+  engine for this file or invalid file") after pushing highlights to it.
+  Push and Restore were never restricted by format and everything in them
+  — `findAllText`, `getPageFromXPointer`, xpointer strings as positions —
+  is built entirely around crengine's rolling-document model; a paging
+  document (PDF, CBZ, DjVu) uses a completely different backend (mupdf)
+  and position model that was never actually tested with this feature.
+  That mismatch is the most plausible cause, so pushing/restoring on a
+  paging document is now refused outright rather than risking it further.
+  The read-only tools (Merge, Undo, Delete, Repair) are unaffected, since
+  they only remove existing entries and can't write a bad position.
+
 ## v1.0.5
 
 - **"Check for updates..."** — new menu action (bottom of the plugin's
